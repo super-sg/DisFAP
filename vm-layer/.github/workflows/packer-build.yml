@@ -1,0 +1,98 @@
+# ============================================================================
+# GitHub Actions: Packer Image Build
+# Validates and builds AMIs when Packer templates or scripts change.
+# ============================================================================
+
+name: Packer Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packer/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packer/**'
+  workflow_dispatch:
+    inputs:
+      image_type:
+        description: 'Image type to build'
+        required: true
+        default: 'windows'
+        type: choice
+        options:
+          - windows
+          - linux
+          - both
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Packer Templates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: '1.10.0'
+
+      - name: Initialize Packer
+        working-directory: packer
+        run: packer init .
+
+      - name: Validate Windows Template
+        working-directory: packer
+        run: packer validate base-windows.pkr.hcl
+
+      - name: Validate Linux Template
+        working-directory: packer
+        run: packer validate base-linux.pkr.hcl
+
+  build:
+    name: Build AMI
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: '1.10.0'
+
+      - name: Initialize Packer
+        working-directory: packer
+        run: packer init .
+
+      - name: Build Windows AMI
+        if: github.event.inputs.image_type != 'linux'
+        working-directory: packer
+        run: packer build -var-file=variables.pkr.hcl base-windows.pkr.hcl
+
+      - name: Build Linux AMI
+        if: github.event.inputs.image_type != 'windows'
+        working-directory: packer
+        run: packer build -var-file=variables.pkr.hcl base-linux.pkr.hcl
+
+      - name: Upload Manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: packer-manifests
+          path: packer/manifest-*.json
