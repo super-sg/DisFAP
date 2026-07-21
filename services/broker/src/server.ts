@@ -74,6 +74,9 @@ export function createBroker(cfg: BrokerConfig, deps: ServerDeps): { start: () =
       }),
     stop: () =>
       new Promise<void>((resolve) => {
+        // Forcibly close live tunnels — a stop() that waits indefinitely for
+        // clients to disconnect is a shutdown hang, not a graceful drain.
+        for (const client of wss.clients) client.terminate();
         wss.close(() => http.close(() => resolve()));
       }),
   };
