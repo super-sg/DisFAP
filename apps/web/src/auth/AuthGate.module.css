@@ -1,0 +1,70 @@
+.page {
+  min-height: 60vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 1rem;
+}
+
+.card {
+  width: 100%;
+  max-width: 26rem;
+  text-align: center;
+  padding: 2.5rem 2rem;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(18, 20, 28, 0.92);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+
+.mark {
+  width: 3rem;
+  height: 3rem;
+  margin: 0 auto 1.25rem;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  font-weight: 700;
+  font-size: 1.5rem;
+  color: #0b0d12;
+  background: linear-gradient(135deg, #7c9cff, #4f6ef7);
+}
+
+.title {
+  margin: 0 0 0.5rem;
+  font-size: 1.4rem;
+  color: #f2f4f8;
+}
+
+.subtitle {
+  margin: 0 0 1.5rem;
+  color: rgba(242, 244, 248, 0.62);
+  font-size: 0.95rem;
+}
+
+.error {
+  margin: 0 0 1.25rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  color: #ffd7d7;
+  background: rgba(220, 60, 60, 0.16);
+  border: 1px solid rgba(220, 60, 60, 0.4);
+}
+
+.button {
+  width: 100%;
+  padding: 0.8rem 1rem;
+  border: none;
+  border-radius: 10px;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #0b0d12;
+  background: linear-gradient(135deg, #7c9cff, #4f6ef7);
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

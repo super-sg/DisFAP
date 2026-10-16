@@ -7,8 +7,12 @@ dist/
 .env
 .env.*
 !.env.example
+!.env*.example
 *.pem
 *.key
+
+# dev credential-key directory (durable local key; *.pem already ignored)
+.dfap/
 
 # terraform
 infra/terraform/**/.terraform/

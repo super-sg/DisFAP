@@ -19,8 +19,8 @@ import { GuacdAdapter } from './protocol/guacd-adapter.js';
 import { Tunnel, type SecurityEvent, type TunnelDeps } from './tunnel.js';
 import { wrapWebSocket } from './ws-adapter.js';
 import { InMemoryNonceStore, type NonceStore } from './nonce-store.js';
-import type { SessionResolver } from './session-resolver.js';
-import type { CredentialProvider } from './vault/credential-provider.js';
+import { InMemorySessionResolver, type SessionResolver } from './session-resolver.js';
+import { StaticCredentialProvider, type CredentialProvider } from './vault/credential-provider.js';
 
 export interface ServerDeps {
   resolver: SessionResolver;
@@ -82,13 +82,29 @@ export function createBroker(cfg: BrokerConfig, deps: ServerDeps): { start: () =
   };
 }
 
-// Direct-run entrypoint (node dist/server.js). Wiring of the real resolver and
-// credential provider is completed once the control-plane client lands; until
-// then this throws a clear message rather than starting half-configured.
+// Direct-run entrypoint (node dist/server.js).
 if (import.meta.url === `file://${process.argv[1]}`) {
-  loadConfig();
-  throw new Error(
-    'Broker standalone start requires the control-plane resolver + Vault credential provider. ' +
-      'Use createBroker(cfg, deps) from the composition root once services/api exposes its client.',
-  );
+  const cfg = loadConfig();
+  const resolver = new InMemorySessionResolver();
+  const credentials = new StaticCredentialProvider();
+  const broker = createBroker(cfg, { resolver, credentials });
+  broker
+    .start()
+    .then((port) => {
+      // eslint-disable-next-line no-console
+      console.log(`[broker] DisFAP broker listening on port ${port} (standalone mode)`);
+    })
+    .catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error('[broker] fatal: broker failed to start', err);
+      process.exit(1);
+    });
+
+  const shutdown = async (): Promise<void> => {
+    await broker.stop();
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown());
 }
+

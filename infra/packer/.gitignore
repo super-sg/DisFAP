@@ -1,0 +1,10 @@
+# Packer build artifacts (regenerated every build; never committed).
+manifest.json
+packer_cache/
+
+# Real per-environment var files (copy example.pkrvars.hcl to *.auto.pkrvars.hcl).
+*.auto.pkrvars.hcl
+
+# Offline-harden output (the workspace_images JSON is posted to the control
+# plane, not stored in git).
+offline-harden/out/

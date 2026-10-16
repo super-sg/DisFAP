@@ -1,0 +1,7 @@
+{
+  "mcp": {
+    "21st-dev": {
+      "command": ["npx", "-y", "@21st-dev/mcp"]
+    }
+  }
+}

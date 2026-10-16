@@ -1,0 +1,14 @@
+# Build-context excludes for api.Dockerfile (BuildKit reads this file next to
+# the Dockerfile; patterns are relative to the build context = repo root).
+**/node_modules
+.git
+**/dist
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+!**/.env.example
+**/coverage
+**/*.log
+**/.DS_Store
+deploy/**
+DisFAP Flow*.png

@@ -1,0 +1,33 @@
+{
+  "name": "@disfap/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DisFAP control plane: session lifecycle, warm/cold pool, reaper, connect-token minting, credential staging, billing",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prisma:generate": "prisma generate",
+    "provision:identity": "node dist/cli/provision-identity.js",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "@disfap/broker": "*",
+    "@prisma/client": "^6.2.0",
+    "fastify": "^5.2.0",
+    "jose": "^6.2.12"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-ec2": "^3.700.0",
+    "stripe": "^17.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "prisma": "^6.2.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

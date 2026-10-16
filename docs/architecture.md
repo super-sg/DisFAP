@@ -53,7 +53,29 @@ Weekly reconciliation diffs Cost Explorer against `SUM(usage_records.compute_cos
 
 ## Data model (summary)
 
-Postgres via Prisma — see [services/api/prisma/schema.prisma](../services/api/prisma/schema.prisma). Key tables: `orgs`, `users`, `workspace_templates`, `workspace_images` (AMI + snapshot SHA-256 per build), `pool_instances` (state machine incl. `expires_at` on every instance), `sessions` (incl. `first_pixel_at` — the headline SLI — and `end_reason`), `session_events` (append-only), `recordings` (WORM metadata, `legal_hold`), `audit_log` (hash-chained), `plans` / `subscriptions` / `usage_records` / `stripe_events` (idempotent webhooks via unique event id).
+Postgres via Prisma — see [services/api/prisma/schema.prisma](../services/api/prisma/schema.prisma). Key tables: `orgs`, `users`, `workspace_templates`, `workspace_images` (AMI + snapshot SHA-256 per build), `pool_instances` (state machine incl. `expires_at` on every instance), `sessions` (incl. `first_pixel_at` — the headline SLI — and `end_reason`), `session_events` (append-only), `recordings` (WORM metadata, `legal_hold`), `audit_log` (hash-chained), `plans` / `subscriptions` / `usage_records` / `stripe_events` (idempotent webhooks via unique event id), and the marketplace: `software_licenses` (HSM-sealed credential payload) and `license_rentals` (per-session rental ledger, pair-sealed credential, idempotent Stripe meter event id).
+
+## Software marketplace (spec Layers 1–3)
+
+A second, complementary product surface on the same pixel-only substrate: owners
+list licensed software (MATLAB, AutoCAD, …), rentees pay per hour to use it, and
+the session boots into the licensed app. See
+[spec-implementation-decisions.md](spec-implementation-decisions.md) for the
+decision record.
+
+- **Layer 1 — catalog/tenancy.** `MarketplaceStore` (in-memory dev / Prisma-backed
+  `software_licenses`). Owners POST a license; credentials are HSM-encrypted at
+  ingest and the plaintext never reaches the database.
+- **Layer 2 — HSM + Vault.** `crypto/hsm-rsa.ts` (RSA-4096 seam; Thales
+  Luna / CloudHSM / Vault Transit in production). `DFAP_PAIR_MASTER_KEY` drives
+  the unique per owner-rentee key (`crypto/pair-keys.ts`, HKDF-SHA256) that the
+  rental credential is re-sealed under.
+- **Layer 3 — orchestrator.** `orchestrator/two-thread-orchestrator.ts` runs
+  credential retrieval and VM spooling as parallel threads; the decrypted
+  credential flows into `createSession`, where it is (a) written onto the VM's
+  disk **before boot** by `cloud/disk-injector.ts` and (b) staged in Vault for
+  the guacd handshake. A rental row + Stripe meter event are written; ending the
+  session releases the license automatically.
 
 ## Image pipeline
 

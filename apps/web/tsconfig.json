@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Browser app: pull in the DOM libs on top of the shared ES2023 base. The
+    // repo is ESM with moduleResolution NodeNext (inherited), so relative
+    // imports carry explicit .js extensions even from .tsx sources.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client"],
+    "rootDir": ".",
+    // Vite owns the emit; tsc is used only for type checking here.
+    "noEmit": true,
+    "sourceMap": false,
+    "declaration": false
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "test/**/*.tsx"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

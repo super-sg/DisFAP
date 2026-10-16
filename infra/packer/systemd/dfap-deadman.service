@@ -1,0 +1,34 @@
+# =============================================================================
+# dfap-deadman.service — one-shot check run by dfap-deadman.timer.
+# DisFAP teardown layer 3 (docs/architecture.md). See bin/dfap-deadman.sh for
+# the heartbeat contract. Installed to /etc/systemd/system by harden.sh.
+# =============================================================================
+[Unit]
+Description=DisFAP dead-man switch: self-terminate this VM if the broker heartbeat goes stale
+Documentation=file:///etc/dfap/heartbeat-contract.md
+# We need the network + IMDS reachable to call the EC2 API.
+After=network-online.target
+Wants=network-online.target
+# Cheap skip when the instance is not yet claimed. The script re-checks this
+# too (defence in depth); the condition just avoids waking curl/aws needlessly.
+ConditionPathExists=/var/lib/dfap/armed
+
+[Service]
+Type=oneshot
+# Tunable knobs live here so an environment can change the threshold or set
+# DFAP_DRY_RUN=1 without editing the unit. The leading '-' tolerates absence.
+EnvironmentFile=-/etc/dfap/deadman.env
+ExecStart=/usr/local/sbin/dfap-deadman.sh
+
+# Least-privilege sandboxing that still permits curl (IMDS), the aws CLI, and
+# `systemctl poweroff`. We deliberately do NOT use ProtectSystem=strict etc.
+# because the fallback poweroff needs to talk to systemd/PID1.
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Only families needed for HTTPS to the EC2 API + link-local IMDS.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

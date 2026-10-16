@@ -53,4 +53,6 @@ Node ≥ 22 required. The broker's instruction-filter tests run with no AWS depe
 
 - [docs/architecture.md](docs/architecture.md) — full component design and session lifecycle
 - [docs/security.md](docs/security.md) — threat model and the four isolation layers
+- [docs/spec-implementation-decisions.md](docs/spec-implementation-decisions.md) — decision record for the software-marketplace spec (Layers 1–3)
+- [docs/runbooks/aws-first-session.md](docs/runbooks/aws-first-session.md) — taking DisFAP from `CLOUD_PROVIDER=fake` onto real AWS
 - [docs/adr/](docs/adr/) — why the load-bearing decisions were made

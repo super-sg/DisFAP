@@ -4,7 +4,28 @@
   "private": true,
   "type": "module",
   "description": "DisFAP session gateway: token redemption, Guacamole instruction filtering, guacd tunnel",
+  "main": "dist/server.js",
+  "types": "src/server.ts",
+  "exports": {
+    ".": {
+      "types": "./src/server.ts",
+      "default": "./dist/server.js"
+    },
+    "./src/*.js": {
+      "types": "./src/*.ts",
+      "default": "./dist/*.js"
+    },
+    "./src/*": {
+      "types": "./src/*.ts",
+      "default": "./dist/*"
+    },
+    "./*": {
+      "types": "./src/*.ts",
+      "default": "./dist/*"
+    }
+  },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"

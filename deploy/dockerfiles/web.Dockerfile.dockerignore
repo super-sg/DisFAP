@@ -1,0 +1,18 @@
+# Build-context excludes for web.Dockerfile (BuildKit reads this file next to
+# the Dockerfile; patterns are relative to the build context = repo root).
+# NOTE: web.Dockerfile COPYs deploy/web/nginx.conf, so `deploy/**` is excluded
+# but that one file is re-included.
+**/node_modules
+.git
+**/dist
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+!**/.env.example
+**/coverage
+**/*.log
+**/.DS_Store
+deploy/**
+!deploy/web
+!deploy/web/nginx.conf
+DisFAP Flow*.png

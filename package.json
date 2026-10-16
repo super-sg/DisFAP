@@ -13,6 +13,10 @@
   "scripts": {
     "test": "npm run test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "start": "node scripts/start-all.mjs",
+    "dev": "node scripts/start-all.mjs",
+    "dev:api": "npm run start --workspace=@disfap/api",
+    "dev:web": "npm run dev --workspace=@disfap/web"
   }
 }

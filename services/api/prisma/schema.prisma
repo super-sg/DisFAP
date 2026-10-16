@@ -1,0 +1,447 @@
+// DisFAP control-plane schema (Postgres).
+//
+// Invariants encoded here:
+//  - Credentials NEVER live in this database. `sessions.vault_cred_path` is a
+//    pointer into Vault; `workspace_templates.guac_params` holds connection
+//    parameters (geometry, color depth, ...) but never a username or password.
+//  - `audit_log` is hash-chained (prev_hash -> hash) and append-only.
+//  - `pool_instances` model the burn-after-reading fleet (ADR-004): every row
+//    carries an `expires_at` set at creation so the reaper can always make
+//    progress even if the control plane forgets about an instance.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  owner
+  admin
+  member
+  auditor
+}
+
+enum Os {
+  linux
+  windows
+}
+
+enum ConnectionProtocol {
+  rdp
+  vnc
+  dcv
+}
+
+enum PoolState {
+  provisioning
+  warming
+  warm
+  stopped
+  claimed
+  active
+  draining
+  terminating
+  terminated
+  quarantined
+}
+
+enum SessionState {
+  requested
+  allocating
+  ready
+  connected
+  idle
+  disconnected
+  terminating
+  ended
+  failed
+}
+
+enum EndReason {
+  user
+  idle_timeout
+  max_duration
+  admin
+  error
+  spot_interruption
+  orphan_reaped
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+model Org {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  members      OrgMember[]
+  templates    WorkspaceTemplate[]
+  sessions     Session[]
+  auditLog     AuditLog[]
+  subscription Subscription?
+  usageRecords UsageRecord[]
+
+  @@map("orgs")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  memberships        OrgMember[]
+  sessions           Session[]
+  externalIdentities ExternalIdentity[]
+
+  @@map("users")
+}
+
+// Binds an external OIDC identity to an internal DisFAP user. The identity key
+// is (issuer, subject) — never the email, which can change or be reassigned.
+// Populated by an operator/admin (no JIT auto-provisioning): a valid token whose
+// (issuer, subject) has no row here is rejected.
+model ExternalIdentity {
+  id         String   @id @default(cuid())
+  issuer     String
+  subject    String
+  userId     String   @map("user_id")
+  // Informational snapshot only; NOT part of the identity key.
+  email      String?
+  createdAt  DateTime @default(now()) @map("created_at")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([issuer, subject])
+  @@index([userId])
+  @@map("external_identities")
+}
+
+model OrgMember {
+  id     String @id @default(cuid())
+  orgId  String @map("org_id")
+  userId String @map("user_id")
+  role   Role
+
+  org  Org  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+  @@map("org_members")
+}
+
+// ---------------------------------------------------------------------------
+// Workspaces
+// ---------------------------------------------------------------------------
+
+model WorkspaceTemplate {
+  id                 String             @id @default(cuid())
+  orgId              String             @map("org_id")
+  name               String
+  os                 Os
+  connectionProtocol ConnectionProtocol @map("connection_protocol")
+  // Guacamole connection parameters (width, height, color-depth, keyboard, ...).
+  // NEVER credentials — the broker fetches those from Vault at connect time.
+  guacParams         Json               @map("guac_params")
+  idleTimeoutS       Int                @default(900) @map("idle_timeout_s")
+  maxSessionS        Int                @default(28800) @map("max_session_s")
+  recordingEnabled   Boolean            @default(false) @map("recording_enabled")
+  gpu                Boolean            @default(false)
+  version            Int                @default(1)
+  active             Boolean            @default(true)
+  createdAt          DateTime           @default(now()) @map("created_at")
+
+  org       Org            @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  instances PoolInstance[]
+  sessions  Session[]
+
+  @@index([orgId, active])
+  @@map("workspace_templates")
+}
+
+model WorkspaceImage {
+  id               String    @id @default(cuid())
+  cloud            String
+  region           String
+  amiId            String    @map("ami_id")
+  snapshotSha256   String    @map("snapshot_sha256")
+  hardeningProfile String    @map("hardening_profile")
+  builtAt          DateTime  @map("built_at")
+  revokedAt        DateTime? @map("revoked_at")
+
+  @@index([region, cloud])
+  @@map("workspace_images")
+}
+
+// ---------------------------------------------------------------------------
+// Pool / fleet
+// ---------------------------------------------------------------------------
+
+model PoolInstance {
+  id                  String    @id @default(cuid())
+  templateId          String    @map("template_id")
+  region              String
+  az                  String
+  cloudInstanceId     String    @unique @map("cloud_instance_id")
+  privateIp           String?   @map("private_ip")
+  state               PoolState
+  claimedBySessionId  String?   @map("claimed_by_session_id")
+  securityGroupId     String?   @map("security_group_id")
+  launchedAt          DateTime  @map("launched_at")
+  readyAt             DateTime? @map("ready_at")
+  claimedAt           DateTime? @map("claimed_at")
+  expiresAt           DateTime  @map("expires_at")
+  terminatedAt        DateTime? @map("terminated_at")
+  hourlyCostUsd       Decimal   @map("hourly_cost_usd") @db.Decimal(10, 4)
+
+  template WorkspaceTemplate @relation(fields: [templateId], references: [id])
+
+  @@index([templateId, state])
+  @@index([expiresAt])
+  @@map("pool_instances")
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+model Session {
+  id              String       @id @default(cuid())
+  orgId           String       @map("org_id")
+  userId          String       @map("user_id")
+  templateId      String       @map("template_id")
+  instanceId      String?      @map("instance_id")
+  // Durable link to the marketplace license this session rented (nullable:
+  // base-workspace sessions have none). Stamped by create-session at the same
+  // moment the row is first written, so a claimed license always has a durable
+  // session link to prove liveness before the rental reaper may release it.
+  licenseId       String?      @map("license_id")
+  guacdNodeId     String?      @map("guacd_node_id")
+  state           SessionState
+  requestedAt     DateTime     @default(now()) @map("requested_at")
+  readyAt         DateTime?    @map("ready_at")
+  firstPixelAt    DateTime?    @map("first_pixel_at")
+  connectedAt     DateTime?    @map("connected_at")
+  lastInputAt     DateTime?    @map("last_input_at")
+  disconnectedAt  DateTime?    @map("disconnected_at")
+  endedAt         DateTime?    @map("ended_at")
+  endReason       EndReason?   @map("end_reason")
+  billableSeconds Int?         @map("billable_seconds")
+  clientIp        String?      @map("client_ip")
+  clientUa        String?      @map("client_ua")
+  // Pointer into Vault (e.g. `secret/sessions/{id}/rdp`). Never the secret.
+  vaultCredPath   String?      @map("vault_cred_path")
+  recordingId     String?      @map("recording_id")
+
+  org      Org               @relation(fields: [orgId], references: [id])
+  user     User              @relation(fields: [userId], references: [id])
+  template WorkspaceTemplate @relation(fields: [templateId], references: [id])
+
+  events       SessionEvent[]
+  recordings   Recording[]
+  usageRecords UsageRecord[]
+
+  @@index([orgId, state])
+  @@index([state])
+  @@index([licenseId, state])
+  @@map("sessions")
+}
+
+model SessionEvent {
+  id        String   @id @default(cuid())
+  sessionId String   @map("session_id")
+  at        DateTime @default(now())
+  kind      String
+  actor     String?
+  detail    Json
+
+  session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, at])
+  @@map("session_events")
+}
+
+model Recording {
+  id             String   @id @default(cuid())
+  sessionId      String   @map("session_id")
+  s3Bucket       String   @map("s3_bucket")
+  s3Key          String   @map("s3_key")
+  bytes          BigInt
+  durationS      Int      @map("duration_s")
+  sha256         String
+  kmsKeyId       String   @map("kms_key_id")
+  retentionUntil DateTime @map("retention_until")
+  legalHold      Boolean  @default(false) @map("legal_hold")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  session Session @relation(fields: [sessionId], references: [id])
+
+  @@index([sessionId])
+  @@map("recordings")
+}
+
+// ---------------------------------------------------------------------------
+// Audit (hash-chained, append-only)
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  orgId       String   @map("org_id")
+  actorUserId String?  @map("actor_user_id")
+  action      String
+  targetType  String   @map("target_type")
+  targetId    String   @map("target_id")
+  at          DateTime @default(now())
+  ip          String?
+  detail      Json
+  prevHash    String?  @map("prev_hash")
+  hash        String
+
+  org Org @relation(fields: [orgId], references: [id])
+
+  @@index([orgId, at])
+  @@map("audit_log")
+}
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+model Plan {
+  id               String @id @default(cuid())
+  stripePriceId    String @map("stripe_price_id")
+  name             String
+  includedSeatHours Int   @map("included_seat_hours")
+  overagePriceCents Int   @map("overage_price_cents")
+  maxConcurrent    Int    @map("max_concurrent")
+  features         Json
+
+  subscriptions Subscription[]
+
+  @@map("plans")
+}
+
+model Subscription {
+  id                   String   @id @default(cuid())
+  orgId                String   @unique @map("org_id")
+  stripeCustomerId     String   @map("stripe_customer_id")
+  stripeSubscriptionId String   @map("stripe_subscription_id")
+  planId               String   @map("plan_id")
+  seats                Int
+  status               String
+  currentPeriodStart   DateTime @map("current_period_start")
+  currentPeriodEnd     DateTime @map("current_period_end")
+  cancelAtPeriodEnd    Boolean  @default(false) @map("cancel_at_period_end")
+
+  org  Org  @relation(fields: [orgId], references: [id])
+  plan Plan @relation(fields: [planId], references: [id])
+
+  @@map("subscriptions")
+}
+
+model UsageRecord {
+  id                 String    @id @default(cuid())
+  orgId              String    @map("org_id")
+  sessionId          String    @map("session_id")
+  periodStart        DateTime  @map("period_start")
+  periodEnd          DateTime  @map("period_end")
+  billableSeconds    Int       @map("billable_seconds")
+  computeCostUsd     Decimal   @map("compute_cost_usd") @db.Decimal(12, 6)
+  egressBytes        BigInt    @map("egress_bytes")
+  stripeMeterEventId String?   @unique @map("stripe_meter_event_id")
+  reportedAt         DateTime? @map("reported_at")
+
+  org     Org     @relation(fields: [orgId], references: [id])
+  session Session @relation(fields: [sessionId], references: [id])
+
+  @@index([orgId, periodStart])
+  @@map("usage_records")
+}
+
+model StripeEvent {
+  id            String    @id @default(cuid())
+  stripeEventId String    @unique @map("stripe_event_id")
+  type          String
+  payload       Json
+  processedAt   DateTime? @map("processed_at")
+
+  @@map("stripe_events")
+}
+
+// ---------------------------------------------------------------------------
+// Software-license marketplace (DisFAP spec layers 1–3)
+// ---------------------------------------------------------------------------
+// Invariants (same rule as sessions): credentials NEVER live here as
+// plaintext. `software_licenses.encrypted_credentials` is the HSM RSA-4096
+// payload the owner submitted; `license_rentals.pair_payload` is the
+// credential re-encrypted under the unique per owner-rentee pair key that the
+// orchestrator minted at rent time. Both are opaque ciphertext blobs.
+
+enum LicenseStatus {
+  available
+  rented
+  paused
+}
+
+model SoftwareLicense {
+  id                   String        @id @default(cuid())
+  ownerId              String        @map("owner_id")
+  ownerName            String        @map("owner_name")
+  softwareName         String        @map("software_name")
+  version              String
+  category             String
+  description          String        @default("")
+  os                   Os
+  hourlyRateUsd        Decimal       @map("hourly_rate_usd") @db.Decimal(10, 2)
+  status               LicenseStatus @default(available)
+  currentRenteeId      String?       @map("current_rentee_id")
+  // HSM RSA-4096 payload (EncryptedCredentialPayload JSON). Plaintext never
+  // touches this database — see `crypto/hsm-rsa.ts` (spec layer 2).
+  encryptedCredentials Json          @map("encrypted_credentials")
+  keyFingerprint       String        @map("key_fingerprint")
+  // Workspace template the rental session boots. Intentionally NOT a relation:
+  // dev seed ids (tmpl_win_rdp, …) may not exist as rows in the local DB.
+  templateId           String        @map("template_id")
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+
+  rentals LicenseRental[]
+
+  @@index([status, category])
+  @@index([ownerId])
+  @@map("software_licenses")
+}
+
+model LicenseRental {
+  id              String    @id @default(cuid())
+  licenseId       String    @map("license_id")
+  renteeId        String    @map("rentee_id")
+  // The pixel session this rental drove; unique so re-rent while live fails.
+  sessionId       String    @unique @map("session_id")
+  hoursRequested  Int       @map("hours_requested")
+  totalChargedUsd Decimal   @map("total_charged_usd") @db.Decimal(12, 2)
+  // Stripe meter event (idempotent per rental). Null while unreported.
+  meterEventId    String?   @unique @map("meter_event_id")
+  // Credential re-sealed under the per owner-rentee pair key (spec TA-4).
+  pairPayload     Json?     @map("pair_payload")
+  startedAt       DateTime  @default(now()) @map("started_at")
+  endedAt         DateTime? @map("ended_at")
+
+  license SoftwareLicense @relation(fields: [licenseId], references: [id])
+
+  @@index([licenseId, startedAt])
+  @@index([renteeId, startedAt])
+  @@map("license_rentals")
+}

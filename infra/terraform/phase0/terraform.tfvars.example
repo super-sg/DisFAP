@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# phase0 :: terraform.tfvars.example
+#
+# Copy to terraform.tfvars and fill in. terraform.tfvars is GITIGNORED
+# (infra/terraform/**/*.tfvars) — only this .example file is committed. Never
+# put real secrets here; this file only carries non-secret config.
+# ---------------------------------------------------------------------------
+
+aws_region  = "us-east-1"
+name_prefix = "disfap-phase0"
+
+# REQUIRED: the hardened, Packer-built session workspace AMI. Getting this wrong
+# is a security hole, so there is no default.
+session_ami_id = "ami-0123456789abcdef0"
+
+# REQUIRED: where budget alarms are emailed.
+budget_notification_email = "ops@example.com"
+
+# Optional: pin the control-host AMI. Empty resolves the latest AL2023 arm64.
+# control_host_ami_id = ""
+
+# Optional: restrict who can reach the web app on 443. Default is the whole
+# internet; tighten to your VPN/office ranges if you can.
+# web_ingress_cidrs = ["203.0.113.0/24"]

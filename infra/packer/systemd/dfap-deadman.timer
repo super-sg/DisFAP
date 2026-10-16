@@ -1,0 +1,22 @@
+# =============================================================================
+# dfap-deadman.timer — fire the dead-man check every minute.
+# The 10-minute staleness threshold lives in the SCRIPT, not here; this timer
+# just wakes it often enough to detect a stale heartbeat promptly. Installed
+# and enabled by harden.sh (WantedBy=timers.target).
+# =============================================================================
+[Unit]
+Description=Run the DisFAP dead-man switch check every minute
+Documentation=file:///etc/dfap/heartbeat-contract.md
+
+[Timer]
+# First check shortly after boot (gives the control plane a moment to arm and
+# the broker a moment to write the first heartbeat), then every minute.
+OnBootSec=2min
+OnUnitActiveSec=1min
+# Tolerate a little scheduler slack; also survive a suspend/clock jump.
+AccuracySec=15s
+Persistent=false
+Unit=dfap-deadman.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,168 @@
+.root {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  width: 100vw;
+  background: #000;
+  overflow: hidden;
+}
+
+.viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── Overlay ────────────────────────────────────────────────────────────── */
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(6, 8, 13, 0.85);
+  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  padding: 1.5rem;
+  animation: dfap-fade-in 300ms var(--dfap-ease) both;
+}
+
+.overlayCard {
+  background: var(--dfap-surface);
+  border: 1px solid var(--dfap-border);
+  border-radius: var(--dfap-radius-xl);
+  padding: clamp(1.75rem, 4vw, 2.75rem);
+  max-width: 34rem;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 1.15rem;
+  align-items: flex-start;
+  box-shadow: var(--dfap-shadow-lg);
+  animation: dfap-scale-in 400ms var(--dfap-ease) 100ms both;
+}
+
+.overlayTitle {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.overlayText {
+  margin: 0;
+  color: var(--dfap-text-dim);
+  line-height: 1.5;
+  font-size: 0.9rem;
+}
+
+.overlayActions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 0.25rem;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+.retryButton,
+.exitButton,
+.endButton {
+  padding: 0.55rem 1.15rem;
+  border-radius: var(--dfap-radius-md);
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--dfap-border);
+  transition: transform var(--dfap-duration) var(--dfap-ease),
+              box-shadow var(--dfap-duration) var(--dfap-ease),
+              background var(--dfap-duration) var(--dfap-ease),
+              border-color var(--dfap-duration) var(--dfap-ease);
+}
+
+.retryButton {
+  background: var(--dfap-accent);
+  color: #fff;
+  border-color: var(--dfap-accent);
+}
+
+.retryButton:hover {
+  background: var(--dfap-accent-hi);
+  border-color: var(--dfap-accent-hi);
+  transform: translateY(-1px);
+  box-shadow: var(--dfap-shadow-glow);
+}
+
+.exitButton {
+  background: transparent;
+  color: var(--dfap-text-dim);
+}
+
+.exitButton:hover {
+  background: var(--dfap-surface-hi);
+  color: var(--dfap-text);
+  border-color: var(--dfap-border-hi);
+}
+
+/* ── Chrome bar ─────────────────────────────────────────────────────────── */
+.chrome {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.55rem 1.25rem;
+  background: var(--dfap-surface);
+  border-top: 1px solid var(--dfap-border);
+}
+
+.title {
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--dfap-text);
+  letter-spacing: -0.01em;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.recording {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--dfap-danger);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.recDot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--dfap-danger);
+  box-shadow: 0 0 6px var(--dfap-danger-glow);
+  animation: dfap-rec-blink 1.4s steps(2, jump-none) infinite;
+}
+
+.endButton {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--dfap-danger);
+  border-color: color-mix(in srgb, var(--dfap-danger) 30%, transparent);
+  padding: 0.4rem 1rem;
+}
+
+.endButton:hover {
+  background: var(--dfap-danger);
+  color: #fff;
+  border-color: var(--dfap-danger);
+  transform: translateY(-1px);
+  box-shadow: 0 0 16px var(--dfap-danger-glow);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recDot {
+    animation: none;
+  }
+}

@@ -1,0 +1,64 @@
+# =============================================================================
+# DisFAP — Caddy reverse proxy (Phase-0)
+# =============================================================================
+# The single internet-facing process. Terminates TLS and fans out to the three
+# app services on the private `edge` network by DNS name. guacd/Postgres/Redis/
+# Vault are NOT routable from here — Caddy only knows web/api/broker.
+#
+# Env (from compose, see .env.example):
+#   DFAP_SITE_ADDRESS  site address. "localhost" for local dev; a real FQDN in
+#                      production (Caddy then auto-provisions Let's Encrypt).
+#   CADDY_ACME_EMAIL   ACME contact address for the production certificate.
+# =============================================================================
+
+{
+	# ACME contact used only when a public FQDN is set as the site address.
+	email {$CADDY_ACME_EMAIL:admin@localhost}
+}
+
+{$DFAP_SITE_ADDRESS:localhost} {
+	# Compress everything except the WebSocket (Caddy skips upgraded conns).
+	encode zstd gzip
+
+	# Security headers. HSTS is safe here because everything is HTTPS-only.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Never advertise the reverse proxy.
+		-Server
+	}
+
+	# --- Control-plane API -----------------------------------------------------
+	# Path prefix is preserved: the API mounts its router under /api, so the
+	# Stripe webhook URL (https://<host>/api/billing/webhook) stays stable.
+	handle /api/* {
+		reverse_proxy api:3000
+	}
+
+	# --- Broker WebSocket tunnel (pixels) -------------------------------------
+	# Caddy v2 detects the `Upgrade: websocket` header and proxies the raw,
+	# bidirectional stream automatically — no extra directives needed. The
+	# DFAP1 connect token arrives as the first WS *frame*, never in the URL or
+	# a header, so it never lands in an access log.
+	handle /tunnel* {
+		reverse_proxy broker:8080
+	}
+
+	# --- Browser client (static SPA) ------------------------------------------
+	# Everything else is the React app served by the `web` nginx container.
+	handle {
+		reverse_proxy web:80
+	}
+
+	# --- TLS -------------------------------------------------------------------
+	# PHASE-0 LOCAL DEV: Caddy's built-in CA issues a self-signed cert for
+	# `localhost`. Your browser will warn once — trust it, or install Caddy's
+	# root (see README "Trusting the local CA").
+	#
+	# PRODUCTION: delete the line below and set DFAP_SITE_ADDRESS to your FQDN
+	# plus CADDY_ACME_EMAIL. Caddy then auto-provisions a real Let's Encrypt
+	# certificate over the published :80/:443 — nothing else changes.
+	tls internal
+}

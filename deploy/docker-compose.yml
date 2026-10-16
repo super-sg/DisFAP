@@ -1,0 +1,264 @@
+# =============================================================================
+# DisFAP — Phase-0 all-in-one deployment (docs/architecture.md §"Phase-0")
+# =============================================================================
+# Everything runs on ONE t4g.small (arm64/Graviton) in Docker Compose:
+#   API, broker, guacd, single-node Vault, Postgres, Redis, Caddy (TLS).
+# No pool (cold launches), no NAT Gateway, AWS Budget alarm at $50.
+#
+# SECURITY POSTURE OF THIS FILE (see comments inline):
+#   - Caddy is the ONLY service that publishes host ports (443 + 80).
+#   - guacd, Postgres, Redis and Vault publish NOTHING — they are reachable
+#     only over the private `internal` bridge network, which is marked
+#     `internal: true` (no route to the internet, no route to the host).
+#   - guacd is never public: the broker reaches it over `edge` by DNS name;
+#     its 4822 port is never mapped to the host.
+#   - The DFAP1 connect token is sent as the first WebSocket frame to /tunnel;
+#     it is never a query string or header, so Caddy access logs never see it.
+#
+# Run from THIS directory:   make up   (i.e. `docker compose up -d` here)
+# =============================================================================
+
+name: disfap-phase0
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  # `edge` carries browser-facing + egress traffic. Default bridge => the
+  # containers on it can reach the internet (api -> Stripe/AWS, guacd -> the
+  # ephemeral session VMs over RDP). Only Caddy maps ports to the host.
+  edge:
+    driver: bridge
+
+  # `internal` is a closed network: `internal: true` means Docker attaches NO
+  # gateway, so nothing here can reach the internet OR be reached from the host.
+  # The stateful/secret services live ONLY here. api/broker straddle both
+  # networks: private data-plane access on `internal`, controlled egress on
+  # `edge`.
+  internal:
+    driver: bridge
+    internal: true
+
+# -----------------------------------------------------------------------------
+# Named volumes (data that must survive `make down` / container replacement)
+# -----------------------------------------------------------------------------
+volumes:
+  pgdata:       # Postgres 16 data directory
+  vaultdata:    # Vault file storage (Phase-0 ONLY — see vault/config.hcl WARNING)
+  redisdata:    # Redis AOF — keeps the jti burn-list across restarts so a
+                # token cannot be replayed through a broker/redis bounce.
+  caddydata:    # Caddy-issued certs + ACME account (self-signed CA in Phase-0)
+  caddyconfig:
+
+services:
+  # ===========================================================================
+  # guacd — Guacamole proxy daemon (RDP/VNC/SSH -> Guacamole wire protocol).
+  # ===========================================================================
+  # NOT PUBLISHED. Reachable only by the broker over `edge` as `guacd:4822`.
+  # It needs `edge` (not `internal`) because it dials OUT to the session VMs.
+  # guacd must never be internet-reachable: a public guacd is a direct pivot
+  # onto every session VM. Keeping its port unmapped is layer-0 of that.
+  guacd:
+    image: guacamole/guacd:1.5.5
+    restart: unless-stopped
+    networks:
+      - edge
+    # No `ports:` — intentional. The broker talks to it by service name.
+
+  # ===========================================================================
+  # Postgres 16 — control-plane database (sessions, orgs, usage_records, ...).
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks:
+      - internal          # private only; never exposed to the host
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ===========================================================================
+  # Redis 7 — DFAP1 jti nonce burn-list (single-use connect-token replay guard)
+  # ===========================================================================
+  # Password-protected and AOF-persisted so a restart does not open a replay
+  # window. Private network only.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - internal
+    # requirepass from .env; appendonly keeps burned jtis durable.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    environment:
+      # Only used by the healthcheck shell below.
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ===========================================================================
+  # Vault — session credential broker (KV-v2 + response-wrapped, read-once).
+  # ===========================================================================
+  # !!! PHASE-0 ONLY: single node, FILE storage, TLS disabled on the listener
+  # !!! (it is reached only over the private `internal` network), and it must
+  # !!! be initialised + unsealed BY HAND after first boot (see README).
+  # !!! Production MUST use integrated storage (Raft, 3+ nodes) with KMS
+  # !!! auto-unseal. That is stated in vault/config.hcl and the README.
+  vault:
+    image: hashicorp/vault:1.15
+    restart: unless-stopped
+    networks:
+      - internal
+    # No `-dev`: dev mode is in-memory, unauthenticated and unsealed — unsafe
+    # even for Phase-0. We run a real server against a file backend instead.
+    # The image entrypoint runs `vault server -config=/vault/config` and scans
+    # that directory, so we pass just `server` and mount our config file there.
+    command: ["server"]
+    environment:
+      # So the in-container `vault` CLI (healthcheck, `make` helpers) works.
+      VAULT_ADDR: http://127.0.0.1:8200
+    cap_add:
+      # Lets Vault mlock its memory so secrets never swap to disk. Phase-0 sets
+      # disable_mlock=true in config.hcl (single-box simplicity), so this is a
+      # no-op today — granted now so enabling mlock later is a one-line change.
+      - IPC_LOCK
+    volumes:
+      - vaultdata:/vault/data
+      - ./vault/config.hcl:/vault/config/config.hcl:ro
+    healthcheck:
+      # Exit 0 = unsealed+active, exit 2 = sealed. Both mean "process is fine";
+      # anything else is genuinely unhealthy.
+      test: ["CMD-SHELL", "vault status >/dev/null 2>&1; c=$$?; [ $$c -eq 0 ] || [ $$c -eq 2 ]"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===========================================================================
+  # api — control plane (services/api): sessions, pool, reaper, billing, audit.
+  # ===========================================================================
+  # Straddles both networks: `internal` for Postgres/Redis/Vault, `edge` for
+  # egress to Stripe + AWS. NOT published — Caddy proxies /api/* to it.
+  api:
+    build:
+      context: ..                                   # repo root => npm workspaces resolve
+      dockerfile: deploy/dockerfiles/api.Dockerfile
+    restart: unless-stopped
+    networks:
+      - internal
+      - edge
+    env_file:
+      - .env
+    environment:
+      # Fixed intra-compose wiring (self-documenting; overrides any .env drift).
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      VAULT_ADDR: http://vault:8200
+      GUACD_HOST: guacd
+      GUACD_PORT: "4822"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_started        # api starts even if Vault is sealed;
+                                            # it fails session CREATION with a
+                                            # clear error (docs/security.md).
+    # No `ports:` — reached only via Caddy at https://<host>/api/*.
+
+  # ===========================================================================
+  # broker — session gateway (services/broker): token redeem, filter, tunnel.
+  # ===========================================================================
+  # Receives the browser WebSocket via Caddy (/tunnel), reaches guacd on `edge`
+  # and Redis/Vault/api on `internal`. NOT published.
+  broker:
+    build:
+      context: ..
+      dockerfile: deploy/dockerfiles/broker.Dockerfile
+    restart: unless-stopped
+    networks:
+      - internal
+      - edge
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      BROKER_PORT: "8080"
+      BROKER_WS_PATH: /tunnel
+      GUACD_HOST: guacd
+      GUACD_PORT: "4822"
+      GUACD_TLS: "false"                  # broker<->guacd stays on the private
+                                          # bridge; mTLS is a production concern.
+      REDIS_URL: ${REDIS_URL}
+      VAULT_ADDR: http://vault:8200
+    depends_on:
+      guacd:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_started
+      api:
+        condition: service_started        # control-plane resolver + cred provider
+    # No `ports:` — reached only via Caddy at wss://<host>/tunnel.
+
+  # ===========================================================================
+  # web — browser client (apps/web): React + guacamole-common-js, built to a
+  # static bundle and served by its own nginx. Caddy proxies / to it.
+  # ===========================================================================
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/dockerfiles/web.Dockerfile
+      # Vite bakes VITE_* at BUILD time, so the public URLs are build args.
+      # Change them => `make build web` to rebuild (documented in README).
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_WS_URL: ${VITE_WS_URL:-wss://localhost/tunnel}
+        VITE_STRIPE_PUBLISHABLE_KEY: ${VITE_STRIPE_PUBLISHABLE_KEY:-}
+    restart: unless-stopped
+    networks:
+      - edge                              # only Caddy talks to it
+    # No `ports:` — reached only via Caddy at https://<host>/.
+
+  # ===========================================================================
+  # caddy — reverse proxy + automatic TLS. The ONLY internet-facing service.
+  # ===========================================================================
+  #   /            -> web:80    (static SPA)
+  #   /api/*       -> api:3000  (control plane)
+  #   /tunnel      -> broker:8080 (WebSocket; Caddy v2 auto-upgrades)
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    networks:
+      - edge
+    ports:
+      - "443:443"     # HTTPS (and HTTP/3 if enabled)
+      - "80:80"       # HTTP -> HTTPS redirect + ACME http-01 challenge
+    environment:
+      DFAP_SITE_ADDRESS: ${DFAP_SITE_ADDRESS:-localhost}
+      CADDY_ACME_EMAIL: ${CADDY_ACME_EMAIL:-admin@localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data       # issued certs / ACME account — must persist
+      - caddyconfig:/config
+    depends_on:
+      - web
+      - api
+      - broker
