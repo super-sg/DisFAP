@@ -76,6 +76,7 @@ class InMemorySessionRepo implements SessionRepo {
       firstPixelAt: null,
       connectedAt: null,
       disconnectedAt: null,
+      disconnectDeadlineAt: null,
       endedAt: null,
       endReason: null,
       billableSeconds: null,

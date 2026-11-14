@@ -17,7 +17,7 @@
   "dependencies": {
     "@disfap/broker": "*",
     "@prisma/client": "^6.2.0",
-    "fastify": "^5.2.0",
+    "fastify": "^5.12.7",
     "jose": "^6.2.12"
   },
   "optionalDependencies": {

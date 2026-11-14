@@ -9,11 +9,12 @@
  * they can be split: the broker calls the API over HTTP/gRPC instead.
  */
 
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { loadConfig, type ApiConfig } from './config.js';
 import { buildKeyring } from './keyring.js';
-import { buildApp, type ApiServices, type SessionView } from './app.js';
+import { buildApp, type ApiServices } from './app.js';
 import type { SessionRecord } from './ports.js';
 
 import { getPrisma, type PrismaClient } from './db/client.js';
@@ -31,12 +32,13 @@ import {
   PrismaMembershipRepo,
   PrismaIdentityRepo,
   PrismaGuestBindingStore,
-} from './db/prisma-repos.js';
+} from './db/repos/index.js';
 
 import { FakeCloudProvider, AwsCloudProvider, type CloudProvider } from './cloud/provider.js';
 import { NoPreBootInjector, OfflineImageInjector, deriveImageWrapKey, type PreBootInjector } from './cloud/disk-injector.js';
 import { CloudInitInjector } from './cloud/cloud-init-injector.js';
 import { FakeVaultClient, HttpVaultClient, type VaultClient } from './vault/vault-client.js';
+import { AppRoleTokenSource } from './vault/vault-auth.js';
 import { InMemoryWrapTokenCache, type WrapTokenCache } from './vault/wrap-token-cache.js';
 import { VaultCredentialIssuer } from './credentials/credential-issuer.js';
 import { ConfiguredLaunchPlanner } from './pool/launch-planner.js';
@@ -49,14 +51,17 @@ import { OidcAuthenticator } from './auth/oidc.js';
 
 import { createSession, type CreateSessionInput, type CreateSessionResult } from './sessions/create-session.js';
 import { endSession, type EndReason } from './sessions/end-session.js';
-import { mintConnectToken } from '@disfap/broker/src/session-token.js';import { handleStripeWebhook } from './billing/webhook.js';
+import { issueConnectHandle } from './sessions/connect-handle.js';
+import { SessionLifecycleReaper } from './sessions/lifecycle-reaper.js';
+import { handleStripeWebhook } from './billing/webhook.js';
 import { FakeStripeClient, RealStripeClient, type StripeClient } from './billing/stripe-client.js';
 
 import { PrismaSessionResolver } from './integration/prisma-session-resolver.js';
 import { VaultCredentialProvider } from './integration/vault-credential-provider.js';
 
 import { createBroker, type ServerDeps as BrokerServerDeps } from '@disfap/broker/src/server.js';
-import type { BrokerConfig } from '@disfap/broker/src/config.js';
+import { RedisNonceStore } from '@disfap/broker/src/redis-nonce-store.js';
+import { loadConfig as loadBrokerConfig, type BrokerConfig } from '@disfap/broker/src/config.js';
 
 import { createCredentialHsm } from './crypto/credential-key-store.js';
 import type { HsmService } from './crypto/hsm-rsa.js';
@@ -78,6 +83,8 @@ export interface BuiltServer {
   rentalReaper: RentalReaper;
   /** Turns "VM launched" into "VM genuinely ready" (truthful readiness). */
   readiness: ReadinessReconciler;
+  /** Durable disconnect-grace + stuck-teardown recovery loop. */
+  lifecycleReaper: SessionLifecycleReaper;
   brokerBindings: { resolver: PrismaSessionResolver; credentialProvider: VaultCredentialProvider };
   wrapCache: WrapTokenCache;
   /** Dev seed catalog — written to the DB (if reachable) once at startup. */
@@ -85,6 +92,19 @@ export interface BuiltServer {
 }
 
 /** Construct everything from config + a Prisma client. */
+/**
+ * A throwaway password for the DEVELOPMENT-ONLY demo catalog.
+ *
+ * These seeds exist so a local evaluation has something to rent; the value is
+ * generated per process instead of being a literal in source (a hardcoded
+ * credential is a hardcoded credential even when it is "just a demo"). The same
+ * string is sealed with the HSM and, for `demoOnly` listings, injected into the
+ * disposable VM, so the flow still works end to end.
+ */
+function demoPassword(): string {
+  return randomBytes(18).toString('base64url');
+}
+
 export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
   const keyring = buildKeyring(cfg);
   const wrapCache: WrapTokenCache = new InMemoryWrapTokenCache();
@@ -94,12 +114,11 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
         region: cfg.aws.region,
         launchTemplateId: cfg.aws.launchTemplateId,
         ...(cfg.aws.launchTemplateVersion ? { launchTemplateVersion: cfg.aws.launchTemplateVersion } : {}),
+        sessionVolumeGiB: cfg.aws.sessionVolumeGiB,
       })
     : new FakeCloudProvider();
 
-  const vault: VaultClient = cfg.vault
-    ? new HttpVaultClient({ addr: cfg.vault.addr, token: cfg.vault.token, mount: cfg.vault.mount })
-    : new FakeVaultClient();
+  const vault: VaultClient = cfg.vault ? buildVaultClient(cfg.vault) : new FakeVaultClient();
 
   const sessions = new PrismaSessionRepo(prisma);
   const templates = new PrismaTemplateRepo(prisma);
@@ -119,7 +138,7 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
   // production — it is not a real secret.
   const pairMaster = buildPairMasterSeed(cfg);
   const pairKeys = new PairKeyService(pairMaster);
-  const launchImageId = 'ami-phase0-placeholder';
+  const launchImageId = cfg.aws?.sessionAmiId ?? 'ami-local-test';
   // Pre-boot injection realization. The sealed-blob injector needs a guest-side
   // decryption key; baking it into a reusable AMI is a shared secret across
   // every instance of that image (forbidden), so it is a DEV/TEST-ONLY seam. In
@@ -140,16 +159,19 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
     cfg.env === 'production'
       ? new NoPreBootInjector()
       : cfg.cloud === 'aws'
-        ? new CloudInitInjector()
+        ? new CloudInitInjector({
+            ...(cfg.evalSshPublicKey ? { sshPublicKey: cfg.evalSshPublicKey } : {}),
+          })
         : new OfflineImageInjector(deriveImageWrapKey(pairMaster));
   const planner = new ConfiguredLaunchPlanner(templates, {
     region: cfg.aws?.region ?? 'us-east-1',
     imageId: launchImageId,
-    instanceType: 't4g.small',
+    instanceType: cfg.aws?.sessionInstanceType ?? 't4g.small',
     gpuInstanceType: 'g5.xlarge',
     hourlyCostUsd: 0.0168,
     gpuHourlyCostUsd: 1.006,
     expiryBufferS: 300,
+    requireLinuxRdp: cfg.cloud === 'aws',
   });
 
   // Guest credential provisioning (audit C3 / M8). Composed only when the mode
@@ -195,7 +217,7 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
       ownerName: 'Academic License Pool',
       status: 'available',
       currentRenteeId: null,
-      encryptedCredentials: hsm.encrypt(JSON.stringify({ username: 'matlab_user', password: 'DisFAP_Session_Password_2026!' })),
+      encryptedCredentials: hsm.encrypt(JSON.stringify({ username: 'matlab_user', password: demoPassword() })),
       templateId: 'tmpl_win_rdp',
       createdAt: new Date().toISOString(),
     },
@@ -211,7 +233,7 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
       ownerName: 'ArchStudio Pro',
       status: 'available',
       currentRenteeId: null,
-      encryptedCredentials: hsm.encrypt(JSON.stringify({ username: 'autocad_user', password: 'DisFAP_Cad_Secure_Key!' })),
+      encryptedCredentials: hsm.encrypt(JSON.stringify({ username: 'autocad_user', password: demoPassword() })),
       templateId: 'tmpl_win_rdp',
       createdAt: new Date().toISOString(),
     },
@@ -227,7 +249,7 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
       ownerName: 'VFX Production Hub',
       status: 'available',
       currentRenteeId: null,
-      encryptedCredentials: hsm.encrypt(JSON.stringify({ username: 'premiere_editor', password: 'DisFAP_Creative_Pass!' })),
+      encryptedCredentials: hsm.encrypt(JSON.stringify({ username: 'premiere_editor', password: demoPassword() })),
       templateId: 'tmpl_win_rdp',
       createdAt: new Date().toISOString(),
     },
@@ -243,7 +265,12 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
       ownerName: 'OpenDev Collective',
       status: 'available',
       currentRenteeId: null,
-      encryptedCredentials: hsm.encrypt(JSON.stringify({ username: 'developer', password: 'DisFAP_Linux_Dev_Key!' })),
+      // Seed listings carry only throwaway demo credentials, so they are marked
+      // `demoOnly`: the evaluation injector may install them on a disposable
+      // session VM. A real listing (reusable licensed password) must NOT set it.
+      encryptedCredentials: hsm.encrypt(
+        JSON.stringify({ username: 'developer', password: demoPassword(), demoOnly: true }),
+      ),
       templateId: 'tmpl_linux_dev',
       createdAt: new Date().toISOString(),
     },
@@ -275,6 +302,11 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
   const runEndSession = (sid: string, reason: EndReason, actor: string | null) =>
     endSession(sid, reason, actor, endSessionDeps);
 
+  // Durable session lifecycle: expire reconnect grace windows and retry stuck
+  // teardowns. It calls the SAME runEndSession above, so VM termination,
+  // credential revocation, usage and rental release can never diverge.
+  const lifecycleReaper = new SessionLifecycleReaper({ sessions, endSession: runEndSession });
+
   // Rental reaper: closes expired leases whose driven session is terminal/gone
   // and releases abandoned claims — but ONLY when no non-terminal session is
   // durably linked to the license, so an active session can never lose its
@@ -294,8 +326,8 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
   // FAILED (VM torn down, rental released) — never left hanging, never a
   // fabricated `ready`. On the fake cloud no session is ever `allocating`
   // (createSession marks it ready immediately), so this loop is a no-op there.
-  const readyTimeoutMs = (Number(process.env['DFAP_READY_TIMEOUT_S'] ?? '600') || 600) * 1000;
-  const readyProbePort = Number(process.env['DFAP_READY_PROBE_PORT'] ?? '3389') || 3389;
+  const readyTimeoutMs = cfg.readyTimeoutS * 1000;
+  const readyProbePort = cfg.readyProbePort;
   const readiness = new ReadinessReconciler({
     sessions,
     instances,
@@ -404,27 +436,20 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
     }
   })();
 
-  // Fresh DFAP1 connect handle for a connectable session. Minted on READ (the
-  // browser polls getSession), never persisted, and carrying session id +
-  // identity ONLY (ADR-002). Without this the client polls forever and never
-  // reaches the tunnel — the missing link that blocked step 6 of the demo.
-  const CONNECTABLE_STATES = new Set<string>(['ready', 'connected', 'idle']);
-  const attachConnectHandle = (row: SessionRecord): SessionView => {
-    if (!CONNECTABLE_STATES.has(row.state)) return row;
-    const nowS = Math.floor(Date.now() / 1000);
-    const token = mintConnectToken(
-      { sid: row.id, sub: row.userId, org: row.orgId, ttlSeconds: cfg.connectTokenTtlS, now: nowS },
+  // Fresh DFAP1 capability + matching Vault wrap handle, minted on an
+  // AUTHORIZED read. This is the reconnection path: the previous capability's
+  // jti was burned at the broker and its wrap token consumed, so a refresh or
+  // retry needs a new pair. Vault re-wraps the persisted secret, which is why
+  // this still works after an API restart lost every in-memory handle.
+  const mintConnectHandle = (row: SessionRecord) =>
+    issueConnectHandle(row, {
+      credentialIssuer,
+      wrapCache,
       keyring,
-    );
-    return {
-      ...row,
-      connect: {
-        token,
-        brokerUrl: cfg.brokerUrl,
-        expiresAt: new Date((nowS + cfg.connectTokenTtlS) * 1000).toISOString(),
-      },
-    };
-  };
+      brokerUrl: cfg.brokerUrl,
+      connectTokenTtlS: cfg.connectTokenTtlS,
+      credentialTtlS: cfg.credentialTtlS,
+    });
 
   const services: ApiServices = {
     authenticator,
@@ -481,6 +506,7 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
           firstPixelAt: new Date(),
           connectedAt: new Date(),
           disconnectedAt: null,
+          disconnectDeadlineAt: null,
           endedAt: null,
           endReason: null,
           billableSeconds: 0,
@@ -490,8 +516,9 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
         }));
       }
       if (!row) return null;
-      return attachConnectHandle(row);
+      return row;
     },
+    issueConnectHandle: mintConnectHandle,
     handleWebhook: (rawBody, signature) => handleStripeWebhook(rawBody, signature, { stripe, events: stripeEvents }),
     marketplace,
     orchestrator,
@@ -500,11 +527,24 @@ export function buildServer(cfg: ApiConfig, prisma: PrismaClient): BuiltServer {
   };
 
   const brokerBindings = {
-    resolver: new PrismaSessionResolver({ store: connectStore, wrapCache }),
+    resolver: new PrismaSessionResolver({
+      store: connectStore,
+      wrapCache,
+      graceSeconds: cfg.sessionDisconnectGraceS,
+    }),
     credentialProvider: new VaultCredentialProvider(vault),
   };
 
-  return { services, reaper, rentalReaper, readiness, brokerBindings, wrapCache, devSeeds: seedLicenses };
+  return {
+    services,
+    reaper,
+    rentalReaper,
+    readiness,
+    lifecycleReaper,
+    brokerBindings,
+    wrapCache,
+    devSeeds: seedLicenses,
+  };
 }
 
 /**
@@ -551,54 +591,87 @@ export async function seedMarketplace(store: MarketplaceStore, seeds: SoftwareLi
   }
 }
 
-/** Build the BrokerConfig from the same environment the API reads. */
-function buildBrokerConfig(env: NodeJS.ProcessEnv = process.env): BrokerConfig {
-  const brokerPort = Number(env['BROKER_PORT'] ?? '8080');
-  return {
-    port: Number.isFinite(brokerPort) ? brokerPort : 8080,
-    path: env['BROKER_WS_PATH'] ?? '/tunnel',
-    guacd: {
-      host: env['GUACD_HOST'] ?? '127.0.0.1',
-      port: Number(env['GUACD_PORT'] ?? '4822'),
-      tls: env['GUACD_TLS'] === 'true',
-    },
-    // Shared keyring — same env vars parsed by both api and broker configs.
-    signingKeys: (() => {
-      const raw = env['DFAP_SIGNING_KEYS'] ?? '';
-      const keys: Record<string, string> = {};
-      for (const pair of raw.split(',')) {
-        const [kid, b64] = pair.split(':');
-        if (kid && b64) keys[kid.trim()] = b64.trim();
-      }
-      return keys;
-    })(),
-    signingKid: env['DFAP_SIGNING_KID'] ?? '',
-    ...(env['REDIS_URL'] ? { redisUrl: env['REDIS_URL'] } : {}),
-    maxClientViolations: Number(env['MAX_CLIENT_VIOLATIONS'] ?? '5'),
+/**
+ * Build the broker's real client from validated Vault settings.
+ *
+ * The token source is chosen once here: AppRole (preferred) mints and refreshes
+ * short-lived tokens; a static token is used as-is. Neither path ever falls back
+ * to an anonymous call, so a Vault outage blocks provisioning instead of
+ * silently degrading to "no credential".
+ */
+export function buildVaultClient(vault: NonNullable<ApiConfig['vault']>, fetchImpl?: typeof fetch): HttpVaultClient {
+  const common = {
+    addr: vault.addr,
+    mount: vault.mount,
+    ...(vault.namespace ? { namespace: vault.namespace } : {}),
+    ...(fetchImpl ? { fetchImpl } : {}),
   };
+  if (vault.auth.kind === 'approle') {
+    return new HttpVaultClient({
+      ...common,
+      tokenSource: new AppRoleTokenSource({
+        addr: vault.addr,
+        roleId: vault.auth.roleId,
+        secretId: vault.auth.secretId,
+        ...(vault.namespace ? { namespace: vault.namespace } : {}),
+        ...(fetchImpl ? { fetchImpl } : {}),
+      }),
+    });
+  }
+  return new HttpVaultClient({ ...common, token: vault.auth.token });
+}
+
+/**
+ * Build the BrokerConfig from the same environment the API reads.
+ *
+ * Delegates to the broker's own `loadConfig`, which is the single place that
+ * enforces the security floor (≥32-byte signing keys, a required guacd CA +
+ * TLS in production unless explicitly acknowledged). Re-implementing the parse
+ * here — as an earlier version did — let the in-process broker run with
+ * cleartext guacd and a short key while the standalone broker refused.
+ */
+export function buildBrokerConfig(env: NodeJS.ProcessEnv = process.env): BrokerConfig {
+  return loadBrokerConfig(env);
 }
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
   const prisma = getPrisma(cfg.databaseUrl);
   const built = buildServer(cfg, prisma);
-  const { services, reaper, rentalReaper, readiness, brokerBindings } = built;
+  const { services, reaper, rentalReaper, readiness, lifecycleReaper, brokerBindings } = built;
 
-  const app = buildApp(services, { logger: true, corsAllowedOrigins: cfg.corsAllowedOrigins });
+  const app = buildApp(services, {
+    logger: true,
+    corsAllowedOrigins: cfg.corsAllowedOrigins,
+    // The API publishes no port; Caddy is the only path in. It overwrites
+    // X-Forwarded-For, and trusting exactly ONE hop (the socket peer) means a
+    // client-supplied header can never move `req.ip` (the rate-limit key) off
+    // the real address. Fastify's types take a function, not a hop count.
+    trustProxy: (_address: string, hop: number) => hop === 0,
+  });
 
   // ── Start the broker in-process ──────────────────────────────────────────
   // The broker requires a SessionResolver + CredentialProvider. In Phase-0
   // these are constructed here from the same Prisma DB and Vault client the
   // API uses. createBroker() returns a { start, stop } handle.
   const brokerCfg = buildBrokerConfig();
+  // Durable single-use jti list when Redis is configured; otherwise the
+  // in-memory list, which a restart forgets (documented limitation).
+  const nonces = brokerCfg.redisUrl ? new RedisNonceStore({ url: brokerCfg.redisUrl }) : undefined;
   const brokerDeps: BrokerServerDeps = {
     resolver: brokerBindings.resolver,
     credentials: brokerBindings.credentialProvider,
+    ...(nonces ? { nonces } : {}),
     onSecurityEvent: (e: unknown) => app.log.warn({ event: e }, 'broker security event'),
   };
   const broker = createBroker(brokerCfg, brokerDeps);
   const brokerPort = await broker.start();
-  app.log.info({ port: brokerPort }, 'DisFAP broker listening');
+  app.log.info({ port: brokerPort, durableNonceStore: Boolean(nonces) }, 'DisFAP broker listening');
+  if (!nonces && cfg.env === 'production') {
+    app.log.warn(
+      'REDIS_URL is not set: connect-token replay protection is in-process only and is lost on restart',
+    );
+  }
 
   // Phase-0 reaper loop: reconcile the fleet and the rental ledger every 60s
   // (architecture.md layer 4 + marketplace recovery).
@@ -617,9 +690,19 @@ async function main(): Promise<void> {
   }, 5_000);
   readinessTimer.unref();
 
+  // Session lifecycle loop: expire reconnect grace windows (persisted
+  // deadlines, not process timers) and retry stuck teardowns. Uses endSession —
+  // the same authority as the HTTP route — so usage/rental/VM effects stay in
+  // one place.
+  const lifecycleTimer = setInterval(() => {
+    lifecycleReaper.reconcile().catch((err) => app.log.error({ err }, 'session lifecycle reaper failed'));
+  }, cfg.sessionReaperIntervalS * 1_000);
+  lifecycleTimer.unref();
+
   const shutdown = async (): Promise<void> => {
     clearInterval(reaperTimer);
     clearInterval(readinessTimer);
+    clearInterval(lifecycleTimer);
     await broker.stop();
     await app.close();
     await prisma.$disconnect();
@@ -628,13 +711,24 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown());
   process.on('SIGINT', () => void shutdown());
 
-  await app.listen({ port: cfg.port, host: '0.0.0.0' });
-  app.log.info({ port: cfg.port, env: cfg.env }, 'DisFAP control plane listening');
+  // The dev-header adapter accepts a client-asserted identity, so a dev build
+  // must never be reachable off-host. Bind loopback; production (OIDC/deny)
+  // keeps the normal all-interface bind behind its authenticated ingress.
+  const listenHost = cfg.authMode === 'dev-header' ? '127.0.0.1' : '0.0.0.0';
+  await app.listen({ port: cfg.port, host: listenHost });
+  app.log.info({ port: cfg.port, host: listenHost, env: cfg.env }, 'DisFAP control plane listening');
 
   // Best-effort dev seed of the software marketplace into the DB (no-ops when
   // already seeded or when the DB is unreachable and the in-memory fallback
   // is active).
-  if (services.marketplace && built.devSeeds) {
+  //
+  // NEVER in production: the seeds are a demo catalog owned by fake tenants,
+  // with throwaway credentials. Writing them into a real marketplace would list
+  // unusable software to every customer and put demo secrets in the database
+  // for no reason.
+  if (cfg.env === 'production') {
+    app.log.info('marketplace seed skipped (production)');
+  } else if (services.marketplace && built.devSeeds) {
     seedMarketplace(services.marketplace, built.devSeeds).catch((err) =>
       app.log.warn({ err }, 'marketplace seed skipped'),
     );

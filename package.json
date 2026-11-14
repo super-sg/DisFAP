@@ -10,6 +10,9 @@
   "engines": {
     "node": ">=22"
   },
+  "overrides": {
+    "qs": "^6.17.0"
+  },
   "scripts": {
     "test": "npm run test --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",

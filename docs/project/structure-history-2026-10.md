@@ -1,10 +1,13 @@
-# DisFAP — Current Project Structure & Implementation Detail
+# DisFAP — Historical Project Structure Snapshot
 
-**Source of truth for this document:** the working tree at
-`/Users/supersg/Documents/Random Projects/DisFAP` (rev r3, last updated
+> Snapshot from 2026-10-16, retained as implementation history. It is not a
+> current status report: use [README.md](../../README.md) for the maintained
+> project overview and [HANDOFF.md](../../HANDOFF.md) for detailed history.
+
+**Source of truth for this snapshot:** the working tree (rev r3, last updated
 2026-10-16), cross-referenced against the source spec
 *"System and Method for Secure Session Brokering with Zero-Exposure Credential
-Injection in Virtual Machines"* (the `.docx` in the repo root).
+Injection in Virtual Machines"* ([archived specification](../specifications/system-and-method-zero-exposure-credential-injection.docx)).
 
 > Status at time of writing: `npm run typecheck` — clean; `npm test` — **265
 > passed** (api 153 · broker 95 · web 17); `@disfap/api` production build —
@@ -48,10 +51,20 @@ DisFAP/
 │   ├── .env.example                                                   # DFAP_DEV_FALLBACK=false, NODE_ENV=production
 │   ├── dockerfiles/
 │   ├── vault/
+│   │   ├── config.hcl                                               # server config (file backend, Phase-0)
+│   │   ├── policies/api.hcl                                         # AppRole policy: sessions KV + wrapping only
+│   │   ├── policies/broker.hcl                                      # unwrap-only (split deployment)
+│   │   └── bootstrap.sh                                             # one-time interactive policies + AppRole
 │   └── web/
 ├── docs/
 │   ├── architecture.md                                              # component map, session lifecycle, teardown layers, marketplace
-│   ├── security.md                                                  # threat model, 4 isolation layers, guarantees 1–5
+│   ├── security.md                                                  # threat model, guarantees 1–9, limitations, patent traceability
+│   ├── security/
+│   │   ├── architecture.md                                          # processes, trust boundaries, lifecycle, authz matrix
+│   │   ├── secrets-management.md                                    # secret inventory, Vault AppRole/policies, rotation
+│   │   ├── threat-model.md                                          # T1–T12 with controls + residual risk
+│   │   ├── incident-response.md                                     # per-secret compromise procedures
+│   │   └── operations.md                                            # boot guards, log signals, limits, backups
 │   ├── spec-implementation-decisions.md                             # spec→implementation decision record (Layers 1–3)
 │   ├── runbooks/aws-first-session.md                                # real-AWS onboarding runbook
 │   └── adr/
@@ -77,7 +90,13 @@ DisFAP/
     │   │       └── 20261016000000_init/                             # offline baseline migration (NOT applied to any DB yet)
     │   │           └── migration.sql
     │   ├── src/
-    │   │   ├── app.ts                                               # HTTP composition + routes
+    │   │   ├── app.ts                                               # Fastify factory: error mapping + CORS only; mounts http/routes/*
+    │   │   ├── http/
+    │   │   │   ├── contracts.ts                                     # ApiServices, SessionView, template fallback, rental ceiling
+    │   │   │   ├── errors.ts                                        # status mapping (4xx detail vs 5xx generic)
+    │   │   │   ├── rate-limit.ts                                    # fixed-window per-IP abuse brake (in-process)
+    │   │   │   ├── session-view.ts                                  # publicSession + read/control authorization rules
+    │   │   │   └── routes/                                          # health, templates, marketplace, sessions, guest-provisioning, billing
     │   │   ├── server.ts                                            # composition root; wires adapters, starts broker in-process, 60s reaper loop
     │   │   ├── config.ts                                            # fail-fast env config; DFAP_DEV_FALLBACK gating, prod guard
     │   │   ├── ports.ts                                             # narrow interfaces (SessionRepo, TemplateRepo, InstanceRepo, …)
@@ -94,17 +113,18 @@ DisFAP/
     │   │   │   ├── launch-planner.ts                                # template → launch spec + hourly cost
     │   │   │   └── reaper.ts                                        # fleet reaper (60s): DescribeInstances left-joined vs DB
     │   │   ├── cloud/
-    │   │   │   ├── provider.ts                                      # CloudProvider port: FakeCloudProvider / AwsCloudProvider (stub)
+    │   │   │   ├── provider.ts                                      # CloudProvider port: FakeCloudProvider / AwsCloudProvider (real EC2)
     │   │   │   └── disk-injector.ts                                 # PreBootInjector port; OfflineImageInjector (AES-256-GCM sealed blob to userData)
     │   │   ├── crypto/
     │   │   │   ├── hsm-rsa.ts                                       # Layer 2: SoftwareHsm RSA-4096 OAEP-SHA256 (ephemeral per-process key in dev)
     │   │   │   └── pair-keys.ts                                     # TA-4: HKDF-SHA256 per owner-rentee pair key (AES-256-GCM)
     │   │   ├── credentials/
-    │   │   │   ├── credential-issuer.ts                             # VaultCredentialIssuer (stages wrap token in Vault)
-    │   │   │   └── vault/
-    │   │   │       ├── vault-client.ts                              # VaultClient port: FakeVaultClient / HttpVaultClient
-    │   │   │       ├── wrap-token-cache.ts
-    │   │   │       └── credential-provider.ts (broker side)
+    │   │   │   └── credential-issuer.ts                             # VaultCredentialIssuer (stages wrap token in Vault)
+    │   │   ├── vault/
+    │   │   │   ├── vault-client.ts                                  # VaultClient port: FakeVaultClient / HttpVaultClient (KV v2 + wrapping)
+    │   │   │   ├── vault-auth.ts                                    # AppRoleTokenSource (cached, single-flight) / StaticTokenSource
+    │   │   │   ├── errors.ts                                        # VaultRequestError / VaultAuthError / WrapTokenConsumedError (status only)
+    │   │   │   └── wrap-token-cache.ts
     │   │   ├── marketplace/
     │   │   │   ├── license-store.ts                                 # Layer 1: MarketplaceStore port + InMemoryMarketplaceStore
     │   │   │   ├── prisma-license-store.ts                          # Prisma implementation of the store
@@ -116,19 +136,28 @@ DisFAP/
     │   │   │   └── webhook.ts                                       # idempotent Stripe webhooks
     │   │   ├── db/
     │   │   │   ├── client.ts                                        # PrismaClient singleton
-    │   │   │   └── prisma-repos.ts                                  # ONLY module importing @prisma/client
+    │   │   │   └── repos/                                           # ONLY modules importing @prisma/client
+    │   │   │       ├── index.ts                                     # barrel — the public surface
+    │   │   │       ├── shared.ts                                    # row→record mapping, ACTIVE_STATES
+    │   │   │       ├── session.ts                                   # SessionRepo + broker connect store
+    │   │   │       ├── identity.ts                                  # membership / external identity / provisioning
+    │   │   │       ├── audit.ts                                     # session events + hash-chained audit log
+    │   │   │       ├── pool.ts                                      # templates, instances, guest bindings, reaper view
+    │   │   │       └── billing.ts                                   # quota, usage ledger, Stripe idempotency
     │   │   └── integration/
     │   │       ├── prisma-session-resolver.ts                       # broker-side session resolution
     │   │       └── vault-credential-provider.ts                     # broker-side Vault credential fetch (read-once)
-    │   └── test/                                                    # api unit/integration tests (153)
+    │   └── test/                                                    # api unit/integration tests (410)
     ├── broker/                                                      # @disfap/broker — session gateway (token redemption, instruction filter, guacd tunnel)
     │   ├── package.json
     │   ├── vitest.config.ts
     │   ├── src/
     │   │   ├── server.ts                                            # createBroker (in-process from API in Phase-0)
-    │   │   ├── config.ts                                            # BrokerConfig (ports, guacd, signing keys, Redis URL optional)
+    │   │   ├── config.ts                                            # BrokerConfig (ports, guacd TLS + pinned CA in prod, signing keys, Redis URL optional)
+    │   │   ├── secrets.ts                                           # in-place scrub of credential material after the guacd handshake
     │   │   ├── session-token.ts                                     # DFAP1: HMAC-SHA256, 60s TTL, single-use jti (NonceStore), alg pinned
-    │   │   ├── nonce-store.ts                                       # jti burn store
+    │   │   ├── nonce-store.ts                                       # jti burn store (in-memory)
+    │   │   ├── redis-nonce-store.ts                                 # durable jti burn store (SET NX EX, fail-closed)
     │   │   ├── session-resolver.ts                                  # sid → target + wrap token (org/sub identity check)
     │   │   ├── tunnel.ts                                            # WebSocket→filtered pixel stream; replay ⇒ terminate session
     │   │   ├── ws-adapter.ts                                        # WebSocket ClientSocket shim
@@ -140,7 +169,7 @@ DisFAP/
     │   │   │   ├── adapter.ts                                       # ProtocolAdapter port
     │   │   │   └── guacd-adapter.ts / guacd-client.ts               # guacd (RDP/VNC) adapter
     │   │   └── vault/credential-provider.ts                         # VaultCredentialProvider (read-once credential fetch)
-    │   └── test/                                                    # broker tests (95): tunnel, session-token, guacd-client, parser, instruction-filter, e2e
+    │   └── test/                                                    # broker tests (114): tunnel, session-token, guacd-client, parser, instruction-filter, config, secrets, e2e
     └── web/ (see apps/web above)
 ```
 
@@ -196,7 +225,7 @@ existing port), and what is explicitly not claimed.
 | What the spec says | Implementation | Status |
 |---|---|---|
 | Manage VMs and sessions (launch/terminate) | `CloudProvider` port + `PoolManager` (claim warm instance or cold-launch via `RunInstances`); every instance stamped with hard `expires_at` | ✅ dev-complete (real AWS behind seam) |
-| Real AWS path | `AwsCloudProvider` class exists as a **stub** | ⚠️ stub only — real `launchInstance`/`terminateInstance` untested; not claimed to work |
+| Real AWS path | `AwsCloudProvider` — **real** EC2 (`RunInstances`/`DescribeInstances`/`TerminateInstances`) | ✅ implemented; covered by tests against an injected EC2 client, and exercised once against a real account (see `docs/runbooks/demo-evaluation.md`). No cost-gated CI integration test. |
 | Burn-after-reading: VM destroyed, never reused | ADR-004; `endSession` terminates instance, deletes SG, revokes Vault credential; no sanitize-and-return path | ✅ implemented (fake cloud) |
 | Fleet reaper (60s) | `Reaper.reconcile()` + `RentalReaper.reconcile()` run every 60s in `server.ts` | ✅ implemented |
 | Per-session security group, no public IP, egress default-deny | Documented in `docs/security.md` Guarantee 3; enforced by terraform (not per-session code in this repo) | ⚠️ infra-level, not verified against real AWS |
@@ -252,7 +281,7 @@ existing port), and what is explicitly not claimed.
 | Command | Result |
 |---|---|
 | `npm run typecheck` | clean (api, broker, web) |
-| `npm test` | **265 passed** (api 153 · broker 95 · web 17) |
+| `npm test` | **570 passed, 7 skipped** (api 410 · broker 114 · web 46) |
 | `npm run build --workspace=@disfap/api` | succeeds (`prisma generate && tsc`) |
 | `npx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script` | generated `prisma/migrations/20261016000000_init/migration.sql` (391 lines) |
 
@@ -260,7 +289,11 @@ existing port), and what is explicitly not claimed.
 
 ## 5. What is NOT done (and not claimed)
 
-- Real AWS/EC2 launch/terminate — `AwsCloudProvider` is a stub; no AWS calls made or credentials needed.
+- Real AWS/EC2 automation — `AwsCloudProvider` is **no longer a stub** (see the
+  corrected table in §4), but there is still **no automated test that calls EC2**:
+  the IAM Identity Center token lives ~1h and CI is not cost-gated. The unit
+  tests inject an EC2 client, so the only real-AWS evidence is one manual run on
+  2026-10-17 (`docs/runbooks/demo-evaluation.md`).
 - Guest-side `dfap-preboot.service` — no in-image unseal/login unit; no Linux/Windows template with preboot.
 - Real HSM (Thales Luna / CloudHSM / Vault Transit) — `SoftwareHsm` ephemeral per-process key in dev.
 - Real Vault cluster — `FakeVaultClient` in dev; `HttpVaultClient` is the seam.

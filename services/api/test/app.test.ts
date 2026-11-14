@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { generateKeyPairSync, sign as signBytes } from 'node:crypto';
-import { buildApp, type ApiServices } from '../src/app.js';
+import { buildApp, type ApiServices, type SessionView } from '../src/app.js';
 import type { SessionRecord } from '../src/ports.js';
 import { generateEphemeralHsm } from '../src/crypto/hsm-rsa.js';
 import { InMemoryMarketplaceStore } from '../src/marketplace/license-store.js';
@@ -34,6 +34,7 @@ function mockServices(
       firstPixelAt: null,
       connectedAt: null,
       disconnectedAt: null,
+      disconnectDeadlineAt: null,
       endedAt: null,
       endReason: null,
       billableSeconds: null,
@@ -144,6 +145,53 @@ describe('API routes (Fastify app)', () => {
     expect(delRes.json().sessionId).toBe('ses_123');
   });
 
+  it('exposes a fresh connect handle on GET /sessions/:id while connectable (the tunnel link)', async () => {
+    // The browser can only reach its session through the DFAP1 handle the
+    // control plane re-mints on read. Without this the client polls forever.
+    const ready: SessionView = {
+      id: 'ses_ready',
+      orgId: 'org_test',
+      userId: 'usr_test',
+      templateId: 'tmpl_linux',
+      instanceId: 'inst_1',
+      licenseId: null,
+      state: 'ready',
+      requestedAt: new Date(),
+      readyAt: new Date(),
+      firstPixelAt: null,
+      connectedAt: null,
+      disconnectedAt: null,
+      disconnectDeadlineAt: null,
+      endedAt: null,
+      endReason: null,
+      billableSeconds: null,
+      vaultCredPath: null,
+      clientIp: null,
+      clientUa: null,
+      connect: {
+        token: 'DFAP1.handle_abc',
+        brokerUrl: 'ws://localhost:8080',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    };
+    const app = buildApp({
+      ...mockServices(),
+      getSession: async (sid) => (sid === 'ses_ready' ? ready : null),
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/api/sessions/ses_ready' });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.connect).toMatchObject({ token: 'DFAP1.handle_abc', brokerUrl: 'ws://localhost:8080' });
+    expect(body.connect.expiresAt).toBeTruthy();
+    // The handle carries a session id + identity only — never host/credential.
+    expect(JSON.stringify(body.connect)).not.toMatch(/password|username|10\.0\.0|rdp/i);
+
+    // A missing session is a 404, not a fabricated handle.
+    const missing = await app.inject({ method: 'GET', url: '/api/sessions/nope' });
+    expect(missing.statusCode).toBe(404);
+  });
+
   it('supports Layer 1 Marketplace and Layer 2 HSM RSA-4096 listing', async () => {
     const app = buildApp(mockServices());
 
@@ -200,6 +248,107 @@ describe('API routes (Fastify app)', () => {
     expect(rentResult.telemetry).toBeDefined();
     expect(typeof rentResult.telemetry.thread1VmSpoolingMs).toBe('number');
     expect(typeof rentResult.telemetry.thread2CredentialRetrievalMs).toBe('number');
+  });
+
+  it('scopes the owner dashboard listing query to the authenticated principal', async () => {
+    const services = mockServices({ userId: 'usr_owner', orgId: 'org_test', role: 'owner' });
+    const mine = await services.marketplace!.create('usr_owner', {
+      softwareName: 'Owner One App',
+      version: '1',
+      category: 'engineering',
+      description: 'mine',
+      os: 'linux',
+      hourlyRateUsd: 2,
+      maxDurationHours: 4,
+      ownerName: 'Owner One',
+      encryptedCredentials: services.hsm!.encrypt(JSON.stringify({ username: 'u', demoOnly: true })),
+    });
+    await services.marketplace!.create('usr_someone_else', {
+      softwareName: 'Not Mine',
+      version: '1',
+      category: 'design',
+      description: 'theirs',
+      os: 'linux',
+      hourlyRateUsd: 1,
+      ownerName: 'Someone Else',
+      encryptedCredentials: services.hsm!.encrypt(JSON.stringify({ username: 'u', demoOnly: true })),
+    });
+    await services.marketplace!.markRented(mine.id, 'usr_renter');
+    await services.marketplace!.recordRental({
+      licenseId: mine.id,
+      renteeId: 'usr_renter',
+      sessionId: 'ses_owner_dash',
+      hoursRequested: 2,
+      totalChargedUsd: 4,
+    });
+
+    const app = buildApp(services, CORS);
+    const res = await app.inject({ method: 'GET', url: '/api/marketplace/licenses/mine' });
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body).toHaveLength(1);
+    expect(body[0]).toMatchObject({
+      id: mine.id,
+      softwareName: 'Owner One App',
+      maxDurationHours: 4,
+      status: 'rented',
+      activeRental: { sessionId: 'ses_owner_dash', renteeId: 'usr_renter' },
+    });
+    // Credentials never appear on the owner dashboard either.
+    expect(JSON.stringify(body)).not.toMatch(/username|password|cipherText/i);
+
+    // A different principal sees an empty owner dashboard, not someone else's.
+    const other = buildApp(mockServices({ userId: 'usr_other', orgId: 'org_test', role: 'member' }), CORS);
+    const otherRes = await other.inject({ method: 'GET', url: '/api/marketplace/licenses/mine' });
+    expect(otherRes.statusCode).toBe(200);
+    expect(otherRes.json()).toEqual([]);
+  });
+
+  it('enforces the owner-declared access duration before renting', async () => {
+    const services = mockServices({ userId: 'usr_renter', orgId: 'org_test', role: 'member' });
+    const lic = await services.marketplace!.create('usr_owner', {
+      softwareName: 'Two Hour App',
+      version: '1',
+      category: 'productivity',
+      description: '',
+      os: 'linux',
+      hourlyRateUsd: 3,
+      maxDurationHours: 2,
+      ownerName: 'Owner',
+      encryptedCredentials: services.hsm!.encrypt(JSON.stringify({ username: 'u', demoOnly: true })),
+    });
+    const app = buildApp(services, CORS);
+
+    const tooLong = await app.inject({
+      method: 'POST',
+      url: '/api/marketplace/rent',
+      payload: { licenseId: lic.id, hoursRequested: 4 },
+    });
+    expect(tooLong.statusCode).toBe(400);
+    expect(tooLong.json().error).toMatch(/at most 2 hour/);
+    // Still available: the rejected request never claimed or launched anything.
+    expect((await services.marketplace!.findById(lic.id))?.status).toBe('available');
+
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/api/marketplace/licenses',
+      payload: {
+        softwareName: 'Bad Duration',
+        os: 'linux',
+        maxDurationHours: 25,
+        credentials: { username: 'u', password: 'Dfap-12345678', demoOnly: true },
+      },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json().error).toMatch(/maxDurationHours/);
+  });
+
+  it('rejects an unauthenticated owner dashboard read (401)', async () => {
+    const services = mockServices();
+    services.authenticator = new FailClosedAuthenticator();
+    const app = buildApp(services, CORS);
+    const res = await app.inject({ method: 'GET', url: '/api/marketplace/licenses/mine' });
+    expect(res.statusCode).toBe(401);
   });
 
   it('supports CORS preflight OPTIONS requests from an approved origin', async () => {

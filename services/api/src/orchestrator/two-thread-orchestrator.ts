@@ -148,6 +148,13 @@ export class TwoThreadOrchestrator {
           username: string;
           password?: string;
           privateKey?: string;
+          /**
+           * The owner's explicit declaration that this listing's credential is
+           * a DEDICATED, throwaway demo credential. Only such a listing may
+           * have its credential written to EC2 userData by the evaluation
+           * injector; a reusable licensed password is refused (fail closed).
+           */
+          demoOnly?: boolean;
         };
         return { credentials, decryptedPlaintext, t2Duration: Date.now() - t2Start };
       } catch (err) {
@@ -180,6 +187,10 @@ export class TwoThreadOrchestrator {
           ...(credentials.password !== undefined ? { password: credentials.password } : {}),
           ...(credentials.privateKey !== undefined ? { privateKey: credentials.privateKey } : {}),
         },
+        // Forward the owner's explicit demo-credential declaration so the
+        // evaluation injector can distinguish a throwaway demo credential from
+        // a reusable licensed password (which it must never put in userData).
+        ...(credentials.demoOnly === true ? { demoOnly: true } : {}),
       });
       const t1Duration = Date.now() - t1Start;
       return { sessionResult, t1Duration };

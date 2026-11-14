@@ -81,6 +81,42 @@ describe('PoolManager.claim', () => {
   });
 });
 
+describe('PoolManager cold-path partial-failure cleanup', () => {
+  /** Empty pool (so the claim is cold) with an insert that always fails. */
+  function failingDb(err: Error): PoolManagerDb {
+    return {
+      $queryRawUnsafe: vi.fn().mockResolvedValue([]),
+      poolInstance: { create: vi.fn().mockRejectedValue(err) },
+    };
+  }
+
+  it('terminates the VM when the pool row cannot be written', async () => {
+    const cloud = new FakeCloudProvider();
+    const terminateSpy = vi.spyOn(cloud, 'terminateInstance');
+
+    const mgr = new PoolManager({ db: failingDb(new Error('db down')), cloud, planner });
+
+    await expect(mgr.claim('tpl_1', 'ses_55')).rejects.toThrow('db down');
+
+    // The VM was already launched, so it is billing and there is no pool row to
+    // bound its life. It must be terminated in place, not left for the reaper's
+    // orphan path to find 15 minutes later.
+    expect(terminateSpy).toHaveBeenCalledWith('i-fake-1');
+    expect(cloud.isTerminated('i-fake-1')).toBe(true);
+  });
+
+  it('still surfaces the database error when the compensating terminate also fails', async () => {
+    const cloud = new FakeCloudProvider();
+    vi.spyOn(cloud, 'terminateInstance').mockRejectedValue(new Error('ec2 unreachable'));
+
+    const mgr = new PoolManager({ db: failingDb(new Error('db down')), cloud, planner });
+
+    // Cleanup is best-effort: the caller must see the real cause. The reaper's
+    // orphan path (tag-based) is the backstop if the terminate never lands.
+    await expect(mgr.claim('tpl_1', 'ses_56')).rejects.toThrow('db down');
+  });
+});
+
 describe('PoolManager pre-boot credential injection (spec step 5)', () => {
   function coldDb(): { db: PoolManagerDb; create: ReturnType<typeof vi.fn> } {
     const $queryRawUnsafe = vi.fn().mockResolvedValue([]);

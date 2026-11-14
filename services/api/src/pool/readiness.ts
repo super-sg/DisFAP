@@ -35,7 +35,7 @@ export interface ReadinessLogger {
 export interface ReadinessReconcilerDeps {
   /** `allocating` sessions this loop advances. */
   sessions: Pick<SessionRepo, 'listByState' | 'update'>;
-  instances: Pick<InstanceRepo, 'findConnect' | 'markState'>;
+  instances: Pick<InstanceRepo, 'findConnect' | 'markState' | 'markConnectHost'>;
   cloud: CloudProvider;
   /**
    * Tears down a session that never became ready (terminate VM + release
@@ -111,50 +111,67 @@ export class ReadinessReconciler {
       outcome.checked += 1;
       const expired = now.getTime() - session.requestedAt.getTime() > this.readyTimeoutMs;
 
-      if (!session.instanceId) {
+      try {
+        if (!session.instanceId) {
+          if (expired) {
+            await this.fail(session.id, outcome, { reason: 'no_instance' });
+          } else {
+            outcome.waiting += 1;
+          }
+          continue;
+        }
+
+        const conn =
+          typeof this.deps.instances.findConnect === 'function'
+            ? await this.deps.instances.findConnect(session.instanceId)
+            : null;
+        if (!conn) {
+          if (expired) await this.fail(session.id, outcome, { reason: 'no_pool_row' });
+          else outcome.waiting += 1;
+          continue;
+        }
+
+        const info = this.deps.cloud.describeInstance
+          ? await this.deps.cloud.describeInstance(conn.cloudInstanceId)
+          : null;
+
+        if (info && TERMINAL_CLOUD_STATES.has(info.state)) {
+          await this.fail(session.id, outcome, { reason: `instance_${info.state}` });
+          continue;
+        }
+
+        const host = info?.publicIp ?? conn.host ?? info?.privateIp ?? undefined;
+        if (info?.state === 'running' && host && (await this.probe(host, this.probePort, this.probeTimeoutMs))) {
+          await this.deps.sessions.update(session.id, { state: 'ready', readyAt: this.now() });
+          await this.deps.instances.markState(session.instanceId, 'active', this.now());
+          // Persist the host we actually reached. The broker dials this value, and
+          // the launch-time record can be stale: RunInstances usually omits the
+          // public IP while the instance is pending, so the pool row may hold the
+          // private IP — unreachable from a control plane running outside the VPC.
+          if (conn.host !== host && typeof this.deps.instances.markConnectHost === 'function') {
+            await this.deps.instances.markConnectHost(session.instanceId, host);
+          }
+          outcome.ready.push(session.id);
+          this.deps.logger?.info(
+            { sessionId: session.id, host, port: this.probePort, cloudInstanceId: conn.cloudInstanceId },
+            'session ready: cloud running + gateway reachable',
+          );
+          continue;
+        }
+
         if (expired) {
-          await this.fail(session.id, outcome, { reason: 'no_instance' });
+          await this.fail(session.id, outcome, { reason: 'readiness_timeout' });
         } else {
           outcome.waiting += 1;
         }
-        continue;
-      }
-
-      const conn =
-        typeof this.deps.instances.findConnect === 'function'
-          ? await this.deps.instances.findConnect(session.instanceId)
-          : null;
-      if (!conn) {
-        if (expired) await this.fail(session.id, outcome, { reason: 'no_pool_row' });
-        else outcome.waiting += 1;
-        continue;
-      }
-
-      const info = this.deps.cloud.describeInstance
-        ? await this.deps.cloud.describeInstance(conn.cloudInstanceId)
-        : null;
-
-      if (info && TERMINAL_CLOUD_STATES.has(info.state)) {
-        await this.fail(session.id, outcome, { reason: `instance_${info.state}` });
-        continue;
-      }
-
-      const host = info?.publicIp ?? conn.host ?? info?.privateIp ?? undefined;
-      if (info?.state === 'running' && host && (await this.probe(host, this.probePort, this.probeTimeoutMs))) {
-        await this.deps.sessions.update(session.id, { state: 'ready', readyAt: this.now() });
-        await this.deps.instances.markState(session.instanceId, 'active', this.now());
-        outcome.ready.push(session.id);
-        this.deps.logger?.info(
-          { sessionId: session.id, host, port: this.probePort, cloudInstanceId: conn.cloudInstanceId },
-          'session ready: cloud running + gateway reachable',
-        );
-        continue;
-      }
-
-      if (expired) {
-        await this.fail(session.id, outcome, { reason: 'readiness_timeout' });
-      } else {
+      } catch (err) {
+        // One unverifiable session must never stall the pass. A throttled
+        // DescribeInstances, or a transient database error on a single row,
+        // would otherwise leave every other pending session waiting too. This
+        // one stays `allocating` and is retried next pass; its hard
+        // `pool_instances.expires_at` and the reaper remain the backstop.
         outcome.waiting += 1;
+        this.deps.logger?.warn({ sessionId: session.id, err }, 'readiness check failed; retrying next pass');
       }
     }
 

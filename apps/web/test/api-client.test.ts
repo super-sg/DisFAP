@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { ApiClient } from '../src/api/client.js';
+import { ApiClient, isConnectable, isTerminal } from '../src/api/client.js';
 
 function fakeFetch(): { calls: Array<[string, RequestInit]>; impl: typeof fetch } {
   const calls: Array<[string, RequestInit]> = [];
@@ -20,6 +20,23 @@ function headerValue(init: RequestInit, name: string): string | undefined {
   const key = Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase());
   return key ? headers[key] : undefined;
 }
+
+describe('session lifecycle predicates', () => {
+  it('treats a disconnected session inside its grace window as connectable', () => {
+    expect(isConnectable('disconnected')).toBe(true);
+    expect(isConnectable('ready')).toBe(true);
+    expect(isConnectable('connected')).toBe(true);
+    expect(isConnectable('idle')).toBe(true);
+    expect(isConnectable('ended')).toBe(false);
+    expect(isConnectable('failed')).toBe(false);
+    expect(isConnectable('terminating')).toBe(false);
+  });
+
+  it('recognises terminal server states (no reconnect UI)', () => {
+    for (const s of ['ended', 'failed', 'terminating'] as const) expect(isTerminal(s)).toBe(true);
+    for (const s of ['ready', 'connected', 'idle', 'disconnected'] as const) expect(isTerminal(s)).toBe(false);
+  });
+});
 
 describe('ApiClient — bearer token', () => {
   it('sends Authorization: Bearer when a getAccessToken provider is supplied', async () => {

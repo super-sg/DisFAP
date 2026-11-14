@@ -102,7 +102,34 @@ export function GuacsessionView(props: GuacsessionViewProps): JSX.Element {
     // element in the stack. That keeps input flowing to guacd while letting the
     // overlay veto the browser's own drag/context-menu/selection behaviour.
     const mouse = new Guacamole.Mouse(overlayEl);
-    const sendMouse = (state: MouseState): void => client.sendMouseState(state);
+    // The stage scales the remote framebuffer down to fit the browser viewport
+    // (CSS max-width/max-height below). Guacamole.Mouse reports coordinates in
+    // the overlay's CSS pixels, so they must be mapped back to guest pixels
+    // BEFORE they reach guacd — otherwise every click lands up/left whenever
+    // the remote display is larger than the stage.
+    const sendMouse = (state: MouseState): void => {
+      const canvas = displayNode.querySelector('canvas');
+      if (!canvas) {
+        client.sendMouseState(state);
+        return;
+      }
+      const cRect = canvas.getBoundingClientRect();
+      const oRect = overlayEl.getBoundingClientRect();
+      if (cRect.width <= 0 || cRect.height <= 0) {
+        client.sendMouseState(state);
+        return;
+      }
+      const clamp = (n: number, max: number): number => Math.max(0, Math.min(max, n));
+      const x = clamp(
+        Math.round((state.x - (cRect.left - oRect.left)) * (canvas.width / cRect.width)),
+        canvas.width - 1,
+      );
+      const y = clamp(
+        Math.round((state.y - (cRect.top - oRect.top)) * (canvas.height / cRect.height)),
+        canvas.height - 1,
+      );
+      client.sendMouseState({ ...state, x, y });
+    };
     mouse.onmousedown = sendMouse;
     mouse.onmouseup = sendMouse;
     mouse.onmousemove = sendMouse;

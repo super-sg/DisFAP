@@ -21,9 +21,26 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
+}
+
+/* Guacamole puts its framebuffer wrapper inside .display with an inline
+   width/height equal to the guest resolution. Clamp the wrapper itself first;
+   `max-width: 100%` on the canvas alone is relative to that wrapper and would
+   never shrink to the browser viewport. */
+.display > :global(div) {
+  max-width: 100%;
+  max-height: 100%;
 }
 
 .display :global(canvas) {
+  /* Fit the remote framebuffer inside the stage instead of cropping it. The
+     input mapping in GuacsessionView scales pointer coordinates back to the
+     canvas's native pixels. */
+  max-width: 100%;
+  max-height: 100%;
+  width: auto !important;
+  height: auto !important;
   /* isolation layer 4: the pixel canvas is never selectable or draggable. */
   user-select: none;
   -webkit-user-select: none;

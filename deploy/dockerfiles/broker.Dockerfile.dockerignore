@@ -13,4 +13,4 @@
 **/*.log
 **/.DS_Store
 deploy/**
-DisFAP Flow*.png
+docs/architecture/assets/disfap-flow.png

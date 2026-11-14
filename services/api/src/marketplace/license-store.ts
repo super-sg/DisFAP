@@ -23,6 +23,8 @@ export interface SoftwareLicense {
   description: string;
   os: 'windows' | 'linux';
   hourlyRateUsd: number;
+  /** Owner-declared maximum rental hours; null/omitted = only the global cap. */
+  maxDurationHours?: number | null;
   ownerId: string;
   ownerName: string;
   status: 'available' | 'rented' | 'paused';
@@ -71,6 +73,8 @@ export interface CreateLicenseInput {
   ownerName?: string;
   encryptedCredentials: EncryptedCredentialPayload;
   templateId?: string;
+  /** Owner-declared maximum rental hours (1..24); omitted = global cap only. */
+  maxDurationHours?: number;
 }
 
 /** An open rental reduced to the fields the rental reaper needs. */
@@ -84,6 +88,10 @@ export interface RentalLease {
 
 export interface MarketplaceStore {
   listAvailable(category?: string): Promise<SoftwareLicense[]>;
+  /** Every listing owned by one principal (owner dashboard, not the catalog). */
+  listByOwner(ownerId: string): Promise<SoftwareLicense[]>;
+  /** Rentals for licenses owned by one principal (owner dashboard). */
+  listRentalsByOwner(ownerId: string): Promise<RentalRecord[]>;
   findById(id: string): Promise<SoftwareLicense | null>;
   create(ownerId: string, input: CreateLicenseInput): Promise<SoftwareLicense>;
 
@@ -170,6 +178,23 @@ export class InMemoryMarketplaceStore implements MarketplaceStore {
     });
   }
 
+  async listByOwner(ownerId: string): Promise<SoftwareLicense[]> {
+    return Array.from(this.licenses.values())
+      .filter((lic) => lic.ownerId === ownerId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async listRentalsByOwner(ownerId: string): Promise<RentalRecord[]> {
+    const owned = new Set(
+      Array.from(this.licenses.values())
+        .filter((lic) => lic.ownerId === ownerId)
+        .map((lic) => lic.id),
+    );
+    return Array.from(this.rentals.values())
+      .filter((rental) => owned.has(rental.licenseId))
+      .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  }
+
   async findById(id: string): Promise<SoftwareLicense | null> {
     return this.licenses.get(id) ?? null;
   }
@@ -184,6 +209,7 @@ export class InMemoryMarketplaceStore implements MarketplaceStore {
       description: input.description,
       os: input.os,
       hourlyRateUsd: input.hourlyRateUsd,
+      ...(input.maxDurationHours !== undefined ? { maxDurationHours: input.maxDurationHours } : {}),
       ownerId,
       ownerName: input.ownerName ?? 'Verified Owner',
       status: 'available',

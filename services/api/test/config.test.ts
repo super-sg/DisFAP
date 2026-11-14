@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vitest';
 
 import { loadConfig } from '../src/config.js';
@@ -21,6 +25,39 @@ describe('loadConfig — DFAP_DEV_FALLBACK gating', () => {
   it('enables devFallback only for an explicit true', () => {
     expect(loadConfig(baseEnv({ DFAP_DEV_FALLBACK: 'true' })).devFallback).toBe(true);
     expect(loadConfig(baseEnv({ DFAP_DEV_FALLBACK: 'false' })).devFallback).toBe(false);
+  });
+
+  describe('loadConfig — AWS launch contract', () => {
+    const aws = {
+      CLOUD_PROVIDER: 'aws',
+      AWS_REGION: 'ap-south-1',
+      AWS_LAUNCH_TEMPLATE_ID: 'lt-0123456789abcdef0',
+      AWS_SESSION_AMI_ID: 'ami-0123456789abcdef0',
+      AWS_SESSION_INSTANCE_TYPE: 't4g.small',
+      AWS_SESSION_ARCHITECTURE: 'arm64',
+    };
+
+    it('requires an explicit non-placeholder AMI and architecture-compatible instance type', () => {
+      const cfg = loadConfig(baseEnv(aws));
+      expect(cfg.aws).toMatchObject({
+        region: 'ap-south-1',
+        sessionAmiId: 'ami-0123456789abcdef0',
+        sessionInstanceType: 't4g.small',
+        sessionArchitecture: 'arm64',
+      });
+    });
+
+    it('rejects a placeholder AMI', () => {
+      expect(() => loadConfig(baseEnv({ ...aws, AWS_SESSION_AMI_ID: 'ami-phase0-placeholder' }))).toThrow(
+        /real ami.*placeholder/,
+      );
+    });
+
+    it('rejects an architecture mismatch', () => {
+      expect(() =>
+        loadConfig(baseEnv({ ...aws, AWS_SESSION_INSTANCE_TYPE: 't3.small', AWS_SESSION_ARCHITECTURE: 'arm64' })),
+      ).toThrow(/incompatible/);
+    });
   });
 
   it('rejects a non-boolean value rather than guessing', () => {
@@ -203,6 +240,111 @@ describe('loadConfig — durable key & provider requirements', () => {
   });
 });
 
+describe('loadConfig — Vault identity and transport', () => {
+  const PAIR = Buffer.alloc(32, 7).toString('base64');
+  const prod = (extra: Record<string, string> = {}): NodeJS.ProcessEnv =>
+    baseEnv({
+      DFAP_ENV: 'production',
+      DFAP_CREDENTIAL_KEY_FILE: '/run/secrets/dfap.pem',
+      DFAP_PAIR_MASTER_KEY: PAIR,
+      ...extra,
+    });
+
+  it('has no Vault at all when VAULT_ADDR is absent', () => {
+    expect(loadConfig(baseEnv()).vault).toBeUndefined();
+  });
+
+  it('parses a static token (fallback identity)', () => {
+    const cfg = loadConfig(baseEnv({ VAULT_ADDR: 'https://vault.internal:8200/', VAULT_TOKEN: 's.tok' }));
+    expect(cfg.vault).toEqual({
+      addr: 'https://vault.internal:8200',
+      mount: 'secret',
+      auth: { kind: 'token', token: 's.tok' },
+    });
+  });
+
+  it('prefers AppRole: role_id + secret_id become a refreshable identity', () => {
+    const cfg = loadConfig(
+      baseEnv({ VAULT_ADDR: 'https://vault.internal:8200', VAULT_APPROLE_ROLE_ID: 'r', VAULT_APPROLE_SECRET_ID: 's' }),
+    );
+    expect(cfg.vault?.auth).toEqual({ kind: 'approle', roleId: 'r', secretId: 's' });
+  });
+
+  it('reads the token / secret_id from files (keeps them out of the env)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dfap-vault-'));
+    try {
+      const tokenFile = join(dir, 'token');
+      writeFileSync(tokenFile, 's.from-file\n', { mode: 0o600 });
+      const cfg = loadConfig(baseEnv({ VAULT_ADDR: 'https://vault.internal:8200', VAULT_TOKEN_FILE: tokenFile }));
+      expect(cfg.vault?.auth).toEqual({ kind: 'token', token: 's.from-file' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an address with no credential instead of making anonymous calls', () => {
+    expect(() => loadConfig(baseEnv({ VAULT_ADDR: 'https://vault.internal:8200' }))).toThrow(/no Vault credential/);
+  });
+
+  it('refuses a static token and AppRole at the same time', () => {
+    expect(() =>
+      loadConfig(
+        baseEnv({ VAULT_ADDR: 'https://v', VAULT_TOKEN: 't', VAULT_APPROLE_ROLE_ID: 'r', VAULT_APPROLE_SECRET_ID: 's' }),
+      ),
+    ).toThrow(/not both/);
+  });
+
+  it('requires role_id and secret_id together', () => {
+    expect(() => loadConfig(baseEnv({ VAULT_ADDR: 'https://v', VAULT_APPROLE_ROLE_ID: 'r' }))).toThrow(
+      /VAULT_APPROLE_SECRET_ID/,
+    );
+    expect(() => loadConfig(baseEnv({ VAULT_ADDR: 'https://v', VAULT_APPROLE_SECRET_ID: 's' }))).toThrow(
+      /VAULT_APPROLE_ROLE_ID/,
+    );
+  });
+
+  it('refuses both inline and file forms of one secret', () => {
+    expect(() =>
+      loadConfig(baseEnv({ VAULT_ADDR: 'https://v', VAULT_TOKEN: 't', VAULT_TOKEN_FILE: '/run/secrets/x' })),
+    ).toThrow(/not both/);
+  });
+
+  it('fails boot when the secret file is missing or empty', () => {
+    expect(() => loadConfig(baseEnv({ VAULT_ADDR: 'https://v', VAULT_TOKEN_FILE: '/nonexistent/x' }))).toThrow(
+      /could not be read/,
+    );
+    const dir = mkdtempSync(join(tmpdir(), 'dfap-vault-'));
+    try {
+      const empty = join(dir, 'empty');
+      writeFileSync(empty, '\n');
+      expect(() => loadConfig(baseEnv({ VAULT_ADDR: 'https://v', VAULT_TOKEN_FILE: empty }))).toThrow(/is empty/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('requires https in production unless cleartext is explicitly acknowledged', () => {
+    expect(() => loadConfig(prod({ VAULT_ADDR: 'http://vault:8200', VAULT_TOKEN: 't' }))).toThrow(/https/);
+    const cfg = loadConfig(
+      prod({ VAULT_ADDR: 'http://vault:8200', VAULT_TOKEN: 't', VAULT_ALLOW_HTTP: 'true' }),
+    );
+    expect(cfg.vault?.addr).toBe('http://vault:8200');
+  });
+
+  it('rejects a non-http(s) address and a multi-segment mount', () => {
+    expect(() => loadConfig(baseEnv({ VAULT_ADDR: 'file:///tmp/vault', VAULT_TOKEN: 't' }))).toThrow(/http/);
+    expect(() => loadConfig(baseEnv({ VAULT_ADDR: 'https://v', VAULT_TOKEN: 't', VAULT_MOUNT: 'a/b' }))).toThrow(
+      /VAULT_MOUNT/,
+    );
+  });
+
+  it('bounds the credential TTL (a secret must not live in Vault for a week)', () => {
+    expect(() => loadConfig(baseEnv({ CREDENTIAL_TTL_S: '30' }))).toThrow(/CREDENTIAL_TTL_S/);
+    expect(() => loadConfig(baseEnv({ CREDENTIAL_TTL_S: '604800' }))).toThrow(/CREDENTIAL_TTL_S/);
+    expect(loadConfig(baseEnv({ CREDENTIAL_TTL_S: '3600' })).credentialTtlS).toBe(3600);
+  });
+});
+
 describe('loadConfig — guest credential provisioning (audit C3 / M8)', () => {
   const PAIR = Buffer.alloc(32, 7).toString('base64');
 
@@ -251,5 +393,78 @@ describe('loadConfig — guest credential provisioning (audit C3 / M8)', () => {
       DFAP_GUEST_IDENTITY_CERT_FILE: '/etc/dfap/aws-identity.pem',
     });
     expect(() => loadConfig(prodEnv)).toThrow(/not production-enabled/);
+  });
+});
+
+describe('loadConfig — readiness tuning', () => {
+  it('defaults to a 600s budget on the RDP port', () => {
+    const cfg = loadConfig(baseEnv());
+    expect(cfg.readyTimeoutS).toBe(600);
+    expect(cfg.readyProbePort).toBe(3389);
+  });
+
+  it('accepts an explicit budget and probe port', () => {
+    const cfg = loadConfig(baseEnv({ DFAP_READY_TIMEOUT_S: '1200', DFAP_READY_PROBE_PORT: '3390' }));
+    expect(cfg.readyTimeoutS).toBe(1200);
+    expect(cfg.readyProbePort).toBe(3390);
+  });
+
+  it('fails boot on a non-numeric, fractional or out-of-range value', () => {
+    for (const bad of ['abc', '0', '29', '3601', '12.5', '-1']) {
+      expect(() => loadConfig(baseEnv({ DFAP_READY_TIMEOUT_S: bad }))).toThrow(/DFAP_READY_TIMEOUT_S/);
+    }
+    for (const bad of ['0', '65536', 'rdp']) {
+      expect(() => loadConfig(baseEnv({ DFAP_READY_PROBE_PORT: bad }))).toThrow(/DFAP_READY_PROBE_PORT/);
+    }
+  });
+
+  it('passes the optional evaluation SSH key through only when set', () => {
+    expect(loadConfig(baseEnv()).evalSshPublicKey).toBeUndefined();
+    expect(loadConfig(baseEnv({ DFAP_EVAL_SSH_PUBKEY: 'ssh-ed25519 AAAA test' })).evalSshPublicKey).toBe(
+      'ssh-ed25519 AAAA test',
+    );
+  });
+});
+
+describe('loadConfig — session disconnect lifecycle', () => {
+  it('defaults to a 30s reconnect grace and a 15s reaper cadence', () => {
+    const cfg = loadConfig(baseEnv());
+    expect(cfg.sessionDisconnectGraceS).toBe(30);
+    expect(cfg.sessionReaperIntervalS).toBe(15);
+  });
+
+  it('accepts explicit bounded values', () => {
+    const cfg = loadConfig(
+      baseEnv({ DFAP_SESSION_DISCONNECT_GRACE_S: '120', DFAP_SESSION_REAPER_INTERVAL_S: '60' }),
+    );
+    expect(cfg.sessionDisconnectGraceS).toBe(120);
+    expect(cfg.sessionReaperIntervalS).toBe(60);
+  });
+
+  it('fails boot when either window is out of range or non-integer', () => {
+    for (const bad of ['0', '4', '601', '12.5', 'abc']) {
+      expect(() => loadConfig(baseEnv({ DFAP_SESSION_DISCONNECT_GRACE_S: bad }))).toThrow(
+        /DFAP_SESSION_DISCONNECT_GRACE_S/,
+      );
+    }
+    for (const bad of ['0', '4', '301', '2.5', 'soon']) {
+      expect(() => loadConfig(baseEnv({ DFAP_SESSION_REAPER_INTERVAL_S: bad }))).toThrow(
+        /DFAP_SESSION_REAPER_INTERVAL_S/,
+      );
+    }
+  });
+});
+
+describe('loadConfig — signing keys', () => {
+  it('refuses a key shorter than 32 bytes, matching the broker', () => {
+    expect(() =>
+      loadConfig(
+        baseEnv({ DFAP_SIGNING_KEYS: `k1:${Buffer.alloc(16, 1).toString('base64')}`, DFAP_SIGNING_KID: 'k1' }),
+      ),
+    ).toThrow(/fewer than 32 bytes/);
+  });
+
+  it('refuses a signing kid that is not in the keyring', () => {
+    expect(() => loadConfig(baseEnv({ DFAP_SIGNING_KID: 'nope' }))).toThrow(/not present in DFAP_SIGNING_KEYS/);
   });
 });

@@ -29,7 +29,7 @@ export interface WorkspaceTemplate {
   name: string;
   description?: string;
   os: 'windows' | 'linux';
-  /** Whether sessions from this template are recorded (WORM, see Guarantee 5). */
+  /** Whether recording is configured for this template; capture/retention require deployment verification. */
   recording: boolean;
 }
 
@@ -55,9 +55,33 @@ export interface MarketplaceLicense {
   description: string;
   os: 'windows' | 'linux';
   hourlyRateUsd: number;
+  maxDurationHours?: number | null;
   ownerName: string;
   status: 'available' | 'rented' | 'paused';
   hsmKeyFingerprint: string;
+}
+
+/** Owner-scoped listing plus the open rental, when one exists. */
+export interface OwnerListing {
+  id: string;
+  softwareName: string;
+  version: string;
+  category: string;
+  description: string;
+  os: 'windows' | 'linux';
+  hourlyRateUsd: number;
+  maxDurationHours: number | null;
+  ownerName: string;
+  status: 'available' | 'rented' | 'paused';
+  createdAt: string;
+  activeRental: {
+    id: string;
+    renteeId: string;
+    sessionId: string;
+    hoursRequested: number;
+    totalChargedUsd: number;
+    startedAt: string;
+  } | null;
 }
 
 /** What an owner submits to publish a listing (Layer 1 + Layer 2). */
@@ -68,8 +92,15 @@ export interface CreateLicenseRequest {
   description?: string;
   os: 'windows' | 'linux';
   hourlyRateUsd?: number;
-  /** Dedicated, non-personal demo credential for the licensed app. */
-  credentials: { username: string; password?: string };
+  /** Owner-declared maximum rental window (1..24 whole hours). */
+  maxDurationHours?: number;
+  /**
+   * Dedicated, non-personal demo credential for the licensed app.
+   * `demoOnly: true` declares it a throwaway demo credential — the only way the
+   * local-evaluation path may install it on the disposable session VM. It is
+   * never set for a person's reusable password.
+   */
+  credentials: { username: string; password?: string; demoOnly?: boolean };
 }
 
 export interface CreatedLicense {
@@ -111,6 +142,8 @@ export interface SessionInfo {
   connect?: ConnectCredentials;
   /** Set once the first pixel has been observed server-side (the headline SLI). */
   firstPixelAt?: string | null;
+  /** When the server will end a disconnected session unless it reconnects. */
+  disconnectDeadlineAt?: string | null;
   endReason?: string | null;
 }
 
@@ -126,9 +159,14 @@ export class ApiError extends Error {
   }
 }
 
-/** True when a session state can accept (or already holds) a pixel tunnel. */
+/**
+ * True when a session state can accept (or already holds) a pixel tunnel.
+ * `disconnected` is included because the server keeps the VM and rental alive
+ * during the reconnect grace window; whether a handle is actually issued is
+ * decided server-side from the persisted deadline.
+ */
 export function isConnectable(state: ServerSessionState): boolean {
-  return state === 'ready' || state === 'connected' || state === 'idle';
+  return state === 'ready' || state === 'connected' || state === 'idle' || state === 'disconnected';
 }
 
 /** True when a session has reached a terminal, non-recoverable state. */
@@ -151,18 +189,27 @@ export interface ApiClientOptions {
    * will reject in any non-dev configuration.
    */
   getAccessToken?: () => Promise<string | null> | string | null;
+  /**
+   * LOCAL DEV ONLY: the demo principal sent as `x-dfap-user` / `x-dfap-org`.
+   * The server's dev-header adapter is refused in production, and the headers
+   * are compiled out of production bundles. Omitting it keeps the historical
+   * `usr_dev` identity for local tests/tools.
+   */
+  devIdentity?: { userId: string; orgId: string };
 }
 
 export class ApiClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly getAccessToken: (() => Promise<string | null> | string | null) | undefined;
+  private readonly devIdentity: { userId: string; orgId: string };
 
   constructor(opts: ApiClientOptions = {}) {
     this.baseUrl = (opts.baseUrl ?? import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/+$/, '');
     // Bind so the injected/global fetch keeps its expected `this`.
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
     this.getAccessToken = opts.getAccessToken;
+    this.devIdentity = opts.devIdentity ?? { userId: 'usr_dev', orgId: 'org_dev' };
   }
 
   /** List the workspace templates the current user is entitled to launch. */
@@ -176,9 +223,14 @@ export class ApiClient {
     return this.request<MarketplaceLicense[]>('GET', `/api/marketplace/licenses${query}`);
   }
 
+  /** Owner-scoped listings + open rentals for the dashboard. */
+  async listMyLicenses(): Promise<OwnerListing[]> {
+    return this.request<OwnerListing[]>('GET', '/api/marketplace/licenses/mine');
+  }
+
   /**
-   * Publish a software listing (Layer 1). Credentials are encrypted server-side
-   * by the Layer 2 HSM and never returned. The owner identity is taken from the
+   * Publish a software listing. Credentials are encrypted server-side by the
+   * software-backed key provider and never returned. The owner identity is taken from the
    * authenticated principal, never from this body.
    */
   async createLicense(input: CreateLicenseRequest): Promise<CreatedLicense> {
@@ -226,7 +278,9 @@ export class ApiClient {
         // headers and is refused outside development. Vite drops them from
         // production bundles. A role header is never sent — the server derives
         // privilege from server-side records, never from the client.
-        ...(import.meta.env.DEV ? { 'x-dfap-user': 'usr_dev', 'x-dfap-org': 'org_dev' } : {}),
+        ...(import.meta.env.DEV
+          ? { 'x-dfap-user': this.devIdentity.userId, 'x-dfap-org': this.devIdentity.orgId }
+          : {}),
         ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
       },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),

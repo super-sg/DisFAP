@@ -15,7 +15,13 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Prisma, PrismaClient } from '@prisma/client';
 
-import { PrismaSessionRepo, PrismaIdentityRepo, PrismaIdentityProvisioningStore } from '../src/db/prisma-repos.js';
+import {
+  PrismaSessionRepo,
+  PrismaSessionConnectStore,
+  PrismaUsageStore,
+  PrismaIdentityRepo,
+  PrismaIdentityProvisioningStore,
+} from '../src/db/repos/index.js';
 import { PrismaMarketplaceStore } from '../src/marketplace/prisma-license-store.js';
 import { provisionIdentity } from '../src/auth/identity-provisioning.js';
 
@@ -207,5 +213,205 @@ describe.skipIf(!url)('PostgreSQL persistence — sessions.license_id (disposabl
     expect((await prisma.licenseRental.findUnique({ where: { id: 'ren_stale_pg' } }))?.pairPayload).toBeNull();
     // Second pass clears nothing.
     expect(await store.clearStalePairPayloads(new Date())).toBe(0);
+  });
+
+  // ── Disconnect lifecycle / idempotent teardown (migration 20261111) ───────
+
+  it('persists and maps the disconnect grace deadline', async () => {
+    const created = await repo.create({
+      orgId: 'org_pg',
+      userId: 'usr_pg',
+      templateId: 'tmpl_pg',
+      state: 'ready',
+    });
+    const deadline = new Date(Date.now() + 30_000);
+    const updated = await repo.update(created.id, {
+      state: 'disconnected',
+      disconnectedAt: new Date(),
+      disconnectDeadlineAt: deadline,
+    });
+    expect(updated.disconnectDeadlineAt?.getTime()).toBe(deadline.getTime());
+
+    const loaded = await repo.findById(created.id);
+    expect(loaded?.state).toBe('disconnected');
+    expect(loaded?.disconnectDeadlineAt?.getTime()).toBe(deadline.getTime());
+  });
+
+  it('claimTermination has exactly one winner across concurrent callers', async () => {
+    const created = await repo.create({
+      orgId: 'org_pg',
+      userId: 'usr_pg',
+      templateId: 'tmpl_pg',
+      state: 'connected',
+    });
+    const at = new Date();
+
+    const results = await Promise.all(Array.from({ length: 8 }, () => repo.claimTermination(created.id, at)));
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const row = await repo.findById(created.id);
+    expect(row?.state).toBe('terminating');
+    // Pinned once, so a retry cannot extend the billable window.
+    expect(row?.disconnectedAt?.getTime()).toBe(at.getTime());
+    // The claim is one-time: no later caller can re-emit the transition.
+    expect(await repo.claimTermination(created.id, new Date())).toBe(false);
+  });
+
+  it('finalizeEnded has exactly one winner and applies the terminal patch once', async () => {
+    const created = await repo.create({
+      orgId: 'org_pg',
+      userId: 'usr_pg',
+      templateId: 'tmpl_pg',
+      state: 'connected',
+    });
+    const at = new Date();
+    await repo.claimTermination(created.id, at);
+
+    const patch = {
+      state: 'ended' as const,
+      endReason: 'user',
+      endedAt: at,
+      disconnectedAt: at,
+      disconnectDeadlineAt: null,
+      billableSeconds: 42,
+    };
+    const results = await Promise.all(Array.from({ length: 8 }, () => repo.finalizeEnded(created.id, patch)));
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const row = await repo.findById(created.id);
+    expect(row?.state).toBe('ended');
+    expect(row?.endReason).toBe('user');
+    expect(row?.billableSeconds).toBe(42);
+    expect(await repo.finalizeEnded(created.id, patch)).toBe(false);
+  });
+
+  it('reconnection wins inside the grace window; the expiry claim wins after it', async () => {
+    const store = new PrismaSessionConnectStore(prisma);
+    const now = new Date();
+
+    const live = await repo.create({
+      orgId: 'org_pg',
+      userId: 'usr_pg',
+      templateId: 'tmpl_pg',
+      state: 'ready',
+    });
+    await repo.update(live.id, {
+      state: 'disconnected',
+      disconnectedAt: now,
+      disconnectDeadlineAt: new Date(now.getTime() + 30_000),
+    });
+    const [claimLive, connectLive] = await Promise.all([
+      repo.claimExpiredDisconnect(live.id, now),
+      store.markConnected(live.id, now),
+    ]);
+    expect(claimLive).toBe(false);
+    expect(connectLive).toBe(true);
+    const liveRow = await repo.findById(live.id);
+    expect(liveRow?.state).toBe('connected');
+    expect(liveRow?.disconnectDeadlineAt).toBeNull();
+
+    const expired = await repo.create({
+      orgId: 'org_pg',
+      userId: 'usr_pg',
+      templateId: 'tmpl_pg',
+      state: 'ready',
+    });
+    await repo.update(expired.id, {
+      state: 'disconnected',
+      disconnectedAt: new Date(now.getTime() - 60_000),
+      disconnectDeadlineAt: new Date(now.getTime() - 1),
+    });
+    const [claimExpired, connectExpired] = await Promise.all([
+      repo.claimExpiredDisconnect(expired.id, now),
+      store.markConnected(expired.id, now),
+    ]);
+    expect(claimExpired).toBe(true);
+    expect(connectExpired).toBe(false);
+    const expiredRow = await repo.findById(expired.id);
+    expect(expiredRow?.state).toBe('terminating');
+    expect(expiredRow?.disconnectDeadlineAt).toBeNull();
+  });
+
+  it('reaper queries return only due disconnected rows and stuck terminating rows', async () => {
+    const now = new Date();
+    const base = { orgId: 'org_pg', userId: 'usr_pg', templateId: 'tmpl_pg', state: 'ready' as const };
+
+    const due = await repo.create(base);
+    await repo.update(due.id, {
+      state: 'disconnected',
+      disconnectedAt: new Date(now.getTime() - 2_000),
+      disconnectDeadlineAt: new Date(now.getTime() - 1_000),
+    });
+    const notDue = await repo.create(base);
+    await repo.update(notDue.id, {
+      state: 'disconnected',
+      disconnectedAt: now,
+      disconnectDeadlineAt: new Date(now.getTime() + 60_000),
+    });
+    const ended = await repo.create({ ...base, state: 'ended' });
+    await repo.update(ended.id, { disconnectDeadlineAt: new Date(now.getTime() - 1_000) });
+
+    const expired = await repo.listDisconnectedExpired(now, 100);
+    const expiredIds = expired.map((r) => r.id);
+    expect(expiredIds).toContain(due.id);
+    expect(expiredIds).not.toContain(notDue.id);
+    expect(expiredIds).not.toContain(ended.id);
+
+    // Once claimed, the same row surfaces to the stuck-teardown retry query.
+    expect(await repo.claimExpiredDisconnect(due.id, now)).toBe(true);
+    const stuck = await repo.listTerminatingBefore(new Date(now.getTime() + 1), 100);
+    expect(stuck.map((r) => r.id)).toContain(due.id);
+    expect(stuck.map((r) => r.id)).not.toContain(notDue.id);
+  });
+
+  it('persists owner access duration and scopes owner listing queries', async () => {
+    const store = new PrismaMarketplaceStore(prisma);
+    const created = await store.create('usr_pg_owner', {
+      softwareName: 'PG Demo App',
+      version: '1',
+      category: 'engineering',
+      description: 'pg',
+      os: 'linux',
+      hourlyRateUsd: 2,
+      maxDurationHours: 4,
+      ownerName: 'PG Owner',
+      encryptedCredentials: {
+        v: 2,
+        algorithm: 'RSA-OAEP-SHA256',
+        keyBits: 4096,
+        keyFingerprint: 'pg-fingerprint',
+        cipherTextB64: 'x',
+        encryptedAt: new Date().toISOString(),
+      },
+    });
+    expect(created.maxDurationHours).toBe(4);
+
+    const mine = await store.listByOwner('usr_pg_owner');
+    expect(mine.map((l) => l.id)).toContain(created.id);
+    expect(await store.listByOwner('usr_pg_other')).toEqual([]);
+  });
+
+  it('usage_records enforces one row per session under concurrent retries', async () => {
+    const session = await repo.create({
+      orgId: 'org_pg',
+      userId: 'usr_pg',
+      templateId: 'tmpl_pg',
+      state: 'ended',
+    });
+    const usage = new PrismaUsageStore(prisma);
+    const data = {
+      orgId: 'org_pg',
+      sessionId: session.id,
+      periodStart: new Date(),
+      periodEnd: new Date(),
+      billableSeconds: 60,
+      computeCostUsd: 0.01,
+      egressBytes: 0,
+    };
+
+    await Promise.all([usage.createUsageRecord(data), usage.createUsageRecord(data), usage.createUsageRecord(data)]);
+
+    expect(await prisma.usageRecord.count({ where: { sessionId: session.id } })).toBe(1);
+    expect(await usage.hasForSession(session.id)).toBe(true);
   });
 });

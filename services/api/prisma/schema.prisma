@@ -236,6 +236,10 @@ model Session {
   connectedAt     DateTime?    @map("connected_at")
   lastInputAt     DateTime?    @map("last_input_at")
   disconnectedAt  DateTime?    @map("disconnected_at")
+  // Reconnect grace deadline, persisted so the window survives an API restart
+  // and can be enforced by the lifecycle reaper rather than a process timer.
+  // Null while connected/ready; cleared when a reconnect or teardown wins.
+  disconnectDeadlineAt DateTime? @map("disconnect_deadline_at")
   endedAt         DateTime?    @map("ended_at")
   endReason       EndReason?   @map("end_reason")
   billableSeconds Int?         @map("billable_seconds")
@@ -255,6 +259,8 @@ model Session {
 
   @@index([orgId, state])
   @@index([state])
+  @@index([state, disconnectDeadlineAt])
+  @@index([state, disconnectedAt])
   @@index([licenseId, state])
   @@map("sessions")
 }
@@ -366,6 +372,9 @@ model UsageRecord {
   org     Org     @relation(fields: [orgId], references: [id])
   session Session @relation(fields: [sessionId], references: [id])
 
+  // Exactly one usage row per session: teardown retries and concurrent end
+  // requests must never double-bill.
+  @@unique([sessionId])
   @@index([orgId, periodStart])
   @@map("usage_records")
 }
@@ -383,11 +392,11 @@ model StripeEvent {
 // ---------------------------------------------------------------------------
 // Software-license marketplace (DisFAP spec layers 1–3)
 // ---------------------------------------------------------------------------
-// Invariants (same rule as sessions): credentials NEVER live here as
-// plaintext. `software_licenses.encrypted_credentials` is the HSM RSA-4096
-// payload the owner submitted; `license_rentals.pair_payload` is the
-// credential re-encrypted under the unique per owner-rentee pair key that the
-// orchestrator minted at rent time. Both are opaque ciphertext blobs.
+// Invariants: credentials NEVER live here as plaintext.
+// `software_licenses.encrypted_credentials` is an opaque ciphertext payload
+// sealed by the configured software-backed RSA key provider;
+// `license_rentals.pair_payload` is sealed under the unique per owner-rentee
+// pair key minted at rent time. Neither field contains plaintext credentials.
 
 enum LicenseStatus {
   available
@@ -405,10 +414,14 @@ model SoftwareLicense {
   description          String        @default("")
   os                   Os
   hourlyRateUsd        Decimal       @map("hourly_rate_usd") @db.Decimal(10, 2)
+  // Owner-declared maximum rental window for this listing, in whole hours.
+  // Null on legacy rows = no listing-level cap (the API's global cap still
+  // applies). The rent route enforces it before any VM is launched.
+  maxDurationHours     Int?          @map("max_duration_hours")
   status               LicenseStatus @default(available)
   currentRenteeId      String?       @map("current_rentee_id")
-  // HSM RSA-4096 payload (EncryptedCredentialPayload JSON). Plaintext never
-  // touches this database — see `crypto/hsm-rsa.ts` (spec layer 2).
+  // Opaque RSA-sealed EncryptedCredentialPayload JSON. The current provider is
+  // software-backed; plaintext never touches this database.
   encryptedCredentials Json          @map("encrypted_credentials")
   keyFingerprint       String        @map("key_fingerprint")
   // Workspace template the rental session boots. Intentionally NOT a relation:

@@ -8,6 +8,8 @@
  * services can be handed the same key material.
  */
 
+import { readFileSync } from 'node:fs';
+
 import type { CredentialKeyConfig } from './crypto/credential-key-store.js';
 import type { GuestProvisioningMode } from './guest/guest-provisioning.js';
 
@@ -66,11 +68,32 @@ export interface ApiConfig {
   connectTokenTtlS: number;
   /** Vault TTL for a staged session credential. */
   credentialTtlS: number;
+  /**
+   * Bounded reconnect window after an ordinary tunnel drop, seconds. During
+   * this period the VM and rental are preserved; after it the lifecycle reaper
+   * ends the session through the normal teardown path.
+   */
+  sessionDisconnectGraceS: number;
+  /** How often the session lifecycle reaper looks for expired disconnects. */
+  sessionReaperIntervalS: number;
 
   cloud: CloudKind;
-  aws?: { region: string; launchTemplateId: string; launchTemplateVersion?: string };
+  aws?: {
+    region: string;
+    launchTemplateId: string;
+    launchTemplateVersion?: string;
+    sessionAmiId: string;
+    sessionInstanceType: string;
+    sessionArchitecture: 'x86_64' | 'arm64';
+    /**
+     * Root EBS volume size for a session instance. Sent with every
+     * `RunInstances` call so the requested size is deterministic even though the
+     * request's block-device mapping overrides the launch template's.
+     */
+    sessionVolumeGiB: number;
+  };
 
-  vault?: { addr: string; token: string; mount: string };
+  vault?: VaultConfig;
 
   /**
    * Durable credential-key provider for owner-credential sealing (Layer 2).
@@ -129,6 +152,43 @@ export interface ApiConfig {
 
   /** Max credential deliveries per live session (idempotent retries included). */
   guestProvisioningMaxDeliveries: number;
+
+  /**
+   * Budget (seconds) for a launched VM to become GENUINELY ready: the cloud
+   * reports `running` AND the gateway port accepts a connection. A session that
+   * misses the budget is failed and its VM torn down — never left `allocating`.
+   */
+  readyTimeoutS: number;
+
+  /** Gateway port the readiness probe dials. 3389 for RDP. */
+  readyProbePort: number;
+
+  /**
+   * Optional SSH public key installed on disposable evaluation VMs for
+   * operator diagnostics. Only reachable on the non-production cloud-init path;
+   * production injects no login material at all.
+   */
+  evalSshPublicKey?: string;
+}
+
+/**
+ * How the control plane authenticates to Vault.
+ *
+ * `approle` is preferred: role_id + secret_id buy a short-lived token that the
+ * client re-mints. `token` is a static, long-lived token for platforms that
+ * cannot issue a workload identity — it must still carry a least-privilege
+ * policy, never a root token.
+ */
+export type VaultAuthConfig =
+  | { kind: 'token'; token: string }
+  | { kind: 'approle'; roleId: string; secretId: string };
+
+export interface VaultConfig {
+  addr: string;
+  mount: string;
+  auth: VaultAuthConfig;
+  /** Vault Enterprise namespace (optional; OSS ignores it). */
+  namespace?: string;
 }
 
 class ConfigError extends Error {}
@@ -144,6 +204,15 @@ function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   if (v === undefined || v === '') return fallback;
   const n = Number(v);
   if (!Number.isInteger(n)) throw new ConfigError(`env ${name} must be an integer, got ${JSON.stringify(v)}`);
+  return n;
+}
+
+/** An integer that must also be in range — a typo fails boot instead of silently misbehaving. */
+function boundedInt(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
+  const n = int(env, name, fallback);
+  if (n < min || n > max) {
+    throw new ConfigError(`env ${name} must be between ${min} and ${max}, got ${n}`);
+  }
   return n;
 }
 
@@ -322,6 +391,102 @@ function parseGuestProvisioning(
   return { mode: 'instance-identity', certs: { ...(file ? { file } : {}), ...(pem ? { pem } : {}) } };
 }
 
+/**
+ * Read secret material from `<NAME>` or `<NAME>_FILE`.
+ *
+ * A file is the safer delivery channel on a container host: an environment
+ * variable is visible in `docker inspect`, `/proc/<pid>/environ`, and crash
+ * dumps, while a mounted secret file is not. Exactly one of the two may be set
+ * (an ambiguous pair fails boot rather than guessing). The value is trimmed of
+ * a trailing newline; an empty file is a configuration error, never "no auth".
+ */
+function secretFromEnv(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const inline = env[name];
+  const file = env[`${name}_FILE`];
+  if (inline && file) {
+    throw new ConfigError(`set either ${name} or ${name}_FILE, not both`);
+  }
+  if (file) {
+    let raw: string;
+    try {
+      raw = readFileSync(file, 'utf8');
+    } catch {
+      throw new ConfigError(`${name}_FILE could not be read (${file})`);
+    }
+    if (raw.length > 8192) throw new ConfigError(`${name}_FILE is implausibly large`);
+    const trimmed = raw.trim();
+    if (trimmed === '') throw new ConfigError(`${name}_FILE is empty`);
+    return trimmed;
+  }
+  if (inline && inline.trim() !== '') return inline.trim();
+  return undefined;
+}
+
+/**
+ * Vault connection + identity.
+ *
+ * Fail-closed rules:
+ *  - `VAULT_ADDR` set but no credential ⇒ boot error (never an anonymous call).
+ *  - a static token AND AppRole ⇒ boot error (exactly one identity).
+ *  - production requires `https://` unless `VAULT_ALLOW_HTTP=true` explicitly
+ *    acknowledges that Vault traffic is confined to a private bridge network.
+ *  - an AppRole secret_id is only accepted with its role_id.
+ */
+function parseVault(env: NodeJS.ProcessEnv, isProduction: boolean): VaultConfig | undefined {
+  const addr = env['VAULT_ADDR'];
+  const token = secretFromEnv(env, 'VAULT_TOKEN');
+  const roleId = env['VAULT_APPROLE_ROLE_ID'];
+  const secretId = secretFromEnv(env, 'VAULT_APPROLE_SECRET_ID');
+
+  if (!addr) {
+    if (token || roleId || secretId) {
+      throw new ConfigError('VAULT_ADDR is required when any Vault credential is configured');
+    }
+    return undefined;
+  }
+
+  let url: URL;
+  try {
+    url = new URL(addr);
+  } catch {
+    throw new ConfigError('VAULT_ADDR must be an absolute http(s) URL');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new ConfigError('VAULT_ADDR must use http:// or https://');
+  }
+  if (isProduction && url.protocol !== 'https:' && env['VAULT_ALLOW_HTTP'] !== 'true') {
+    throw new ConfigError(
+      'production requires https for VAULT_ADDR (set VAULT_ALLOW_HTTP=true only for a Vault reachable solely over a private, non-routable network)',
+    );
+  }
+
+  if (token && roleId) {
+    throw new ConfigError('configure either VAULT_TOKEN (static) or VAULT_APPROLE_ROLE_ID/SECRET_ID (preferred), not both');
+  }
+  if (roleId && !secretId) throw new ConfigError('VAULT_APPROLE_ROLE_ID requires VAULT_APPROLE_SECRET_ID or VAULT_APPROLE_SECRET_ID_FILE');
+  if (secretId && !roleId) throw new ConfigError('VAULT_APPROLE_SECRET_ID requires VAULT_APPROLE_ROLE_ID');
+  if (!token && !roleId) {
+    throw new ConfigError(
+      'VAULT_ADDR is set but no Vault credential was supplied: set VAULT_APPROLE_ROLE_ID + VAULT_APPROLE_SECRET_ID(_FILE) (preferred) or VAULT_TOKEN(_FILE)',
+    );
+  }
+
+  const mount = env['VAULT_MOUNT'] ?? 'secret';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(mount)) {
+    throw new ConfigError('VAULT_MOUNT must be a single path segment');
+  }
+  const namespace = env['VAULT_NAMESPACE'];
+
+  return {
+    addr: url.origin + url.pathname.replace(/\/+$/, ''),
+    mount,
+    ...(namespace ? { namespace } : {}),
+    auth: token
+      ? { kind: 'token', token }
+      : { kind: 'approle', roleId: roleId as string, secretId: secretId as string },
+  };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   const rawKeys = env['DFAP_SIGNING_KEYS'];
   if (!rawKeys) throw new ConfigError('missing required env DFAP_SIGNING_KEYS');
@@ -329,6 +494,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   for (const pair of rawKeys.split(',')) {
     const [kid, b64] = pair.split(':');
     if (!kid || !b64) throw new ConfigError(`malformed DFAP_SIGNING_KEYS entry ${JSON.stringify(pair)}`);
+    // The broker refuses a signing key shorter than 32 bytes (it is the HMAC
+    // key). The API mints those same tokens, so it enforces the same floor
+    // instead of starting with material the broker would reject.
+    if (Buffer.from(b64.trim(), 'base64').length < 32) {
+      throw new ConfigError(
+        `DFAP_SIGNING_KEYS entry for kid ${JSON.stringify(kid.trim())} decodes to fewer than 32 bytes`,
+      );
+    }
     signingKeys[kid.trim()] = b64.trim();
   }
   const signingKid = req(env, 'DFAP_SIGNING_KID');
@@ -375,15 +548,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     signingKid,
     brokerUrl: req(env, 'BROKER_URL'),
     connectTokenTtlS,
-    credentialTtlS: int(env, 'CREDENTIAL_TTL_S', 900),
+    credentialTtlS: boundedInt(env, 'CREDENTIAL_TTL_S', 900, 60, 86_400),
+    // A browser refresh / laptop sleep / Wi-Fi flap must not destroy a VM. The
+    // window is bounded in both directions: too short punishes a normal
+    // reconnect, too long holds paid capacity for an abandoned tab.
+    sessionDisconnectGraceS: boundedInt(env, 'DFAP_SESSION_DISCONNECT_GRACE_S', 30, 5, 600),
+    sessionReaperIntervalS: boundedInt(env, 'DFAP_SESSION_REAPER_INTERVAL_S', 15, 5, 300),
     cloud,
     devFallback,
     authMode,
     corsAllowedOrigins,
     guestProvisioning: guestProvisioning.mode,
-    guestProvisioningTtlS: int(env, 'DFAP_GUEST_PROVISIONING_TTL_S', 900),
-    guestProvisioningMaxDeliveries: int(env, 'DFAP_GUEST_PROVISIONING_MAX_DELIVERIES', 10),
+    guestProvisioningTtlS: boundedInt(env, 'DFAP_GUEST_PROVISIONING_TTL_S', 900, 60, 3600),
+    guestProvisioningMaxDeliveries: boundedInt(env, 'DFAP_GUEST_PROVISIONING_MAX_DELIVERIES', 10, 1, 100),
+    readyTimeoutS: boundedInt(env, 'DFAP_READY_TIMEOUT_S', 600, 30, 3_600),
+    readyProbePort: boundedInt(env, 'DFAP_READY_PROBE_PORT', 3389, 1, 65_535),
   };
+
+  const evalSshPublicKey = env['DFAP_EVAL_SSH_PUBKEY'];
+  if (evalSshPublicKey) cfg.evalSshPublicKey = evalSshPublicKey;
 
   if (guestProvisioning.certs) cfg.guestIdentityCerts = guestProvisioning.certs;
   if (credentialKey) cfg.credentialKey = credentialKey;
@@ -396,16 +579,41 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
   }
 
   if (cloud === 'aws') {
+    const sessionAmiId = req(env, 'AWS_SESSION_AMI_ID');
+    if (!/^ami-[0-9a-f]{8,}$/.test(sessionAmiId) || sessionAmiId === 'ami-phase0-placeholder') {
+      throw new ConfigError('AWS_SESSION_AMI_ID must be a real ami-* identifier, not a placeholder');
+    }
+    const sessionInstanceType = req(env, 'AWS_SESSION_INSTANCE_TYPE');
+    const sessionArchitecture = req(env, 'AWS_SESSION_ARCHITECTURE');
+    if (sessionArchitecture !== 'x86_64' && sessionArchitecture !== 'arm64') {
+      throw new ConfigError("AWS_SESSION_ARCHITECTURE must be 'x86_64' or 'arm64'");
+    }
+    const armFamilies = /^(a1|t4g|c7g|m7g|r7g|x2gd|g5g)\./;
+    const instanceIsArm = armFamilies.test(sessionInstanceType);
+    if (instanceIsArm !== (sessionArchitecture === 'arm64')) {
+      throw new ConfigError(
+        `AWS_SESSION_INSTANCE_TYPE ${sessionInstanceType} is incompatible with AWS_SESSION_ARCHITECTURE ${sessionArchitecture}`,
+      );
+    }
+    // The root volume is sent on RunInstances (see buildRunInstancesInput), so
+    // the size is validated here rather than trusted from the launch template.
+    const sessionVolumeGiB = Number(env['AWS_SESSION_VOLUME_GIB'] ?? '20');
+    if (!Number.isInteger(sessionVolumeGiB) || sessionVolumeGiB < 8 || sessionVolumeGiB > 100) {
+      throw new ConfigError('AWS_SESSION_VOLUME_GIB must be an integer between 8 and 100');
+    }
     cfg.aws = {
       region: req(env, 'AWS_REGION'),
       launchTemplateId: req(env, 'AWS_LAUNCH_TEMPLATE_ID'),
       ...(env['AWS_LAUNCH_TEMPLATE_VERSION'] ? { launchTemplateVersion: env['AWS_LAUNCH_TEMPLATE_VERSION'] } : {}),
+      sessionAmiId,
+      sessionInstanceType,
+      sessionArchitecture,
+      sessionVolumeGiB,
     };
   }
 
-  if (env['VAULT_ADDR']) {
-    cfg.vault = { addr: env['VAULT_ADDR'], token: req(env, 'VAULT_TOKEN'), mount: env['VAULT_MOUNT'] ?? 'secret' };
-  }
+  const vault = parseVault(env, isProduction);
+  if (vault) cfg.vault = vault;
 
   if (env['STRIPE_API_KEY']) {
     cfg.stripe = { apiKey: env['STRIPE_API_KEY'], webhookSecret: req(env, 'STRIPE_WEBHOOK_SECRET') };
@@ -427,7 +635,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ApiConfig {
     }
     if (!cfg.vault) {
       throw new ConfigError(
-        'production requires VAULT_ADDR/VAULT_TOKEN (refusing the in-memory FakeVaultClient)',
+        'production requires VAULT_ADDR plus a scoped Vault identity (VAULT_APPROLE_ROLE_ID/SECRET_ID preferred, or VAULT_TOKEN) — refusing the in-memory FakeVaultClient',
       );
     }
   }

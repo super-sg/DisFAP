@@ -31,6 +31,7 @@ import type { CredentialProvider } from './vault/credential-provider.js';
 import type { SessionResolver } from './session-resolver.js';
 import type { NonceStore } from './nonce-store.js';
 import { verifyConnectToken, type Keyring } from './session-token.js';
+import { scrubCredential } from './secrets.js';
 
 /** Minimal WebSocket surface the tunnel needs — real ws or a test double. */
 export interface ClientSocket {
@@ -73,6 +74,18 @@ const CLOSE_SERVER = 4000; // server-side failure
 
 const DEFAULT_MAX_CLIENT_VIOLATIONS = 5;
 
+/**
+ * What the control plane should do with the session when this tunnel closes.
+ *  - `recoverable` — an ordinary transport drop while streaming: begin the
+ *    bounded reconnect grace window.
+ *  - `fatal`       — a security/protocol event already reported through
+ *    `terminate()`: never grant a grace period.
+ *  - `none`        — the session was never streaming at teardown (token
+ *    rejection, failed handshake, credential failure); it is still in whatever
+ *    connectable state it was and the client may request a fresh handle.
+ */
+type CloseDisposition = 'recoverable' | 'fatal' | 'none';
+
 export class Tunnel {
   private readonly filter = new InstructionFilter();
   private upstream: ProtocolConnection | null = null;
@@ -87,12 +100,26 @@ export class Tunnel {
   ) {
     this.maxClientViolations = deps.maxClientViolations ?? DEFAULT_MAX_CLIENT_VIOLATIONS;
     this.client.onMessage((data) => void this.onClientMessage(data));
-    this.client.onClose(() => this.teardown('client closed', CLOSE_NORMAL, false));
-    this.client.onError((err) => this.teardown(`client error: ${err.message}`, CLOSE_SERVER, false));
+    // A browser socket going away is ordinary: Wi-Fi, laptop sleep, refresh, a
+    // closed tab. Give the renter the grace window instead of destroying the VM.
+    // The guacd side is still closed: with no consumer there is no stream to
+    // keep alive, and the VM reconnect will open a fresh one.
+    this.client.onClose(() => this.teardown('client closed', CLOSE_NORMAL, true, 'recoverable'));
+    this.client.onError((err) => this.teardown(`client error: ${err.message}`, CLOSE_SERVER, true, 'recoverable'));
   }
 
   private emit(e: SecurityEvent): void {
     this.deps.onSecurityEvent?.(e);
+  }
+
+  /**
+   * Explicit predicate rather than an inline comparison: TypeScript narrows
+   * `this.phase` to the value assigned before an `await`, so a direct check
+   * after an async boundary is reported as impossible even though another
+   * callback (a socket close) can have changed it.
+   */
+  private isClosed(): boolean {
+    return this.phase === 'closed';
   }
 
   /** Emit an event scoped to the current session, omitting `sid` when unknown. */
@@ -106,7 +133,7 @@ export class Tunnel {
   }
 
   private async onClientMessage(data: string): Promise<void> {
-    if (this.phase === 'closed') return;
+    if (this.isClosed()) return;
     if (this.phase === 'await_token') {
       await this.handleToken(data);
       return;
@@ -121,7 +148,17 @@ export class Tunnel {
 
   private async handleToken(raw: string): Promise<void> {
     const token = raw.trim();
-    const result = await verifyConnectToken(token, this.deps.keyring, this.deps.nonces);
+    let result: Awaited<ReturnType<typeof verifyConnectToken>>;
+    try {
+      result = await verifyConnectToken(token, this.deps.keyring, this.deps.nonces);
+    } catch {
+      // The nonce store (Redis in a durable deployment) is unavailable. Fail
+      // closed: without a single-use check a leaked token would be replayable.
+      // Never let this rejection escape as an unhandled promise rejection.
+      this.emit({ kind: 'auth_failure', detail: 'nonce store unavailable' });
+      this.teardown('auth failure: nonce store unavailable', CLOSE_POLICY, false);
+      return;
+    }
     if (!result.ok) {
       if (result.terminateSession) {
         // Replay of a validly-signed token: we can read the sid to kill it.
@@ -140,7 +177,9 @@ export class Tunnel {
     this.sid = result.payload.sid;
     this.phase = 'connecting';
 
-    const resolved = await this.deps.resolver.resolve(this.sid);
+    // The capability's jti is part of the credential-handle lookup: a token
+    // minted earlier cannot consume the wrap staged for a newer attempt.
+    const resolved = await this.deps.resolver.resolve(this.sid, result.payload.jti);
     if (!resolved) {
       this.emit({ sid: this.sid, kind: 'auth_failure', detail: 'session not found' });
       this.teardown('session not found', CLOSE_POLICY, false);
@@ -152,11 +191,18 @@ export class Tunnel {
       this.teardown('identity mismatch', CLOSE_POLICY, false);
       return;
     }
-    if (resolved.state !== 'ready' && resolved.state !== 'connected' && resolved.state !== 'idle') {
+    if (
+      resolved.state !== 'ready' &&
+      resolved.state !== 'connected' &&
+      resolved.state !== 'idle' &&
+      resolved.state !== 'disconnected'
+    ) {
       this.emit({ sid: this.sid, kind: 'auth_failure', detail: `session not connectable (${resolved.state})` });
       this.teardown(`session not connectable`, CLOSE_POLICY, false);
       return;
     }
+
+    if (this.isClosed()) return; // client left while we resolved
 
     let credential;
     try {
@@ -167,26 +213,49 @@ export class Tunnel {
       return;
     }
 
+    if (this.isClosed()) {
+      scrubCredential(credential);
+      return;
+    }
+
     try {
       this.upstream = await this.deps.adapter.connect(resolved.target, credential);
     } catch (err) {
       this.teardown(`guacd connect failed: ${(err as Error).message}`, CLOSE_SERVER, false);
       return;
     } finally {
-      // Best-effort scrub of the credential reference; it has served its purpose.
-      credential = { username: '', password: '' };
+      // The adapter has injected the credential into the handshake. Overwrite
+      // the fields in place so neither this scope nor the in-process provider's
+      // copy keeps the plaintext reachable longer than the connect call.
+      scrubCredential(credential);
+    }
+
+    if (this.isClosed()) {
+      this.upstream.close('client left during handshake');
+      return;
+    }
+
+    // Claim the session atomically. If the reconnect-grace reaper (or another
+    // tunnel) won the race, this connection must not become a second owner of a
+    // session that is being torn down.
+    const claimed = await this.deps.resolver.markConnected(this.sid);
+    if (!claimed) {
+      this.emit({ sid: this.sid, kind: 'auth_failure', detail: 'session no longer connectable' });
+      this.teardown('session no longer connectable', CLOSE_POLICY, true);
+      return;
     }
 
     this.wireUpstream(this.upstream);
     this.phase = 'streaming';
-    await this.deps.resolver.markConnected(this.sid);
     this.emit({ sid: this.sid, kind: 'connected', detail: `adapter=${this.deps.adapter.name}` });
   }
 
   private wireUpstream(upstream: ProtocolConnection): void {
     upstream.onData((chunk) => this.pumpServerToClient(chunk));
-    upstream.onClose((reason) => this.teardown(`upstream closed: ${reason}`, CLOSE_NORMAL, true));
-    upstream.onError((err) => this.teardown(`upstream error: ${err.message}`, CLOSE_SERVER, true));
+    // guacd dying is a recoverable transport loss: the VM and rental survive so
+    // the client can reconnect within the grace window.
+    upstream.onClose((reason) => this.teardown(`upstream closed: ${reason}`, CLOSE_NORMAL, true, 'recoverable'));
+    upstream.onError((err) => this.teardown(`upstream error: ${err.message}`, CLOSE_SERVER, true, 'recoverable'));
   }
 
   private pumpClientToServer(data: string): void {
@@ -196,7 +265,7 @@ export class Tunnel {
     } catch (err) {
       if (err instanceof GuacParseError) {
         this.sec('parse_error', `c2s: ${err.message}`);
-        this.teardown('client stream parse error', CLOSE_PROTOCOL, true);
+        void this.failProtocol('client stream parse error');
         return;
       }
       throw err;
@@ -219,7 +288,7 @@ export class Tunnel {
     } catch (err) {
       if (err instanceof GuacParseError) {
         this.sec('parse_error', `s2c: ${err.message}`);
-        this.teardown('server stream parse error', CLOSE_PROTOCOL, true);
+        void this.failProtocol('server stream parse error');
         return;
       }
       throw err;
@@ -236,14 +305,33 @@ export class Tunnel {
 
   private async terminateForAbuse(): Promise<void> {
     if (this.sid) {
-      await this.deps.resolver.terminate(this.sid, 'excessive protocol violations');
+      await this.deps.resolver.terminate(this.sid, 'excessive protocol violations').catch(() => undefined);
       this.emit({ sid: this.sid, kind: 'violation', detail: 'client exceeded violation budget; session terminated' });
     }
-    this.teardown('excessive protocol violations', CLOSE_PROTOCOL, false);
+    // Fatal: the session was already marked `terminating`; no grace window.
+    this.teardown('excessive protocol violations', CLOSE_PROTOCOL, false, 'fatal');
   }
 
-  private teardown(reason: string, code: number, closeUpstream: boolean): void {
-    if (this.phase === 'closed') return;
+  /**
+   * A malformed instruction is a protocol-policy violation, not a network drop.
+   * Fail closed: mark the session terminating (the lifecycle reaper performs
+   * the full VM/credential cleanup) and close without a reconnect window.
+   */
+  private async failProtocol(reason: string): Promise<void> {
+    if (this.sid) {
+      await this.deps.resolver.terminate(this.sid, reason).catch(() => undefined);
+    }
+    this.teardown(reason, CLOSE_PROTOCOL, true, 'fatal');
+  }
+
+  private teardown(
+    reason: string,
+    code: number,
+    closeUpstream: boolean,
+    disposition: CloseDisposition = 'none',
+  ): void {
+    if (this.isClosed()) return;
+    const wasStreaming = this.phase === 'streaming';
     this.phase = 'closed';
     this.sec('closed', reason);
     if (closeUpstream) this.upstream?.close(reason);
@@ -251,6 +339,14 @@ export class Tunnel {
       this.client.close(code, reason.slice(0, 120));
     } catch {
       /* client already gone */
+    }
+    // Notify the control plane exactly once, and only when a live streaming
+    // session is involved. A failed handshake or token rejection leaves the
+    // session in its existing connectable state for a fresh attempt.
+    if (wasStreaming && this.sid && disposition === 'recoverable') {
+      void this.deps.resolver
+        .markDisconnected(this.sid, reason)
+        .catch(() => undefined); // the durable reaper remains the backstop
     }
   }
 }

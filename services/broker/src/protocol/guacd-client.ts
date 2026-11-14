@@ -25,15 +25,20 @@
  * consumer attaches `onData` — so no frame is ever lost at the handoff and
  * there is no listener-swap race.
  *
- * mTLS: in production guacd listens with TLS on 4822 and the broker presents a
- * client cert. That is a socket-factory concern injected via `connectSocket`;
- * this class is transport-agnostic.
+ * Transport security: in production guacd listens over TLS and the broker
+ * verifies it against a pinned CA (`GUACD_CA`), which the config requires
+ * whenever the broker runs in production. guacd does not verify client
+ * certificates, so this is one-way server authentication over a private,
+ * encrypted channel — not mTLS; the channel is additionally protected by
+ * keeping guacd on a private network. That is a socket-factory concern injected
+ * via `connectSocket`; this class is transport-agnostic.
  */
 
 import { connect as tlsConnect } from 'node:tls';
 import { connect as netConnect, type Socket } from 'node:net';
 import { GuacParser, type GuacInstruction } from '../guac/parser.js';
 import { formatInstruction } from '../guac/serialize.js';
+import { scrubGuacParams } from '../secrets.js';
 import type { ProtocolConnection, SessionCredential, SessionTarget } from './adapter.js';
 
 export interface GuacdEndpoint {
@@ -95,18 +100,39 @@ function defaultConnect(endpoint: GuacdEndpoint): Socket {
       cert: endpoint.tls.cert,
       key: endpoint.tls.key,
       servername: endpoint.tls.servername ?? endpoint.host,
+      // The session credential crosses this channel, so an unauthenticated or
+      // downgraded peer must be fatal. Verification is explicit rather than
+      // relying on Node's default, which a future refactor could flip.
+      rejectUnauthorized: true,
+      minVersion: 'TLSv1.2',
     }) as unknown as Socket;
   }
   return netConnect({ host: endpoint.host, port: endpoint.port });
 }
 
 /**
- * Build the ordered `connect` values that positionally match the parameter
- * names guacd listed in `args` (excluding the leading VERSION element).
+ * Protocol-version element guacd puts first in `args` (Guacamole >= 1.5.0).
+ * The client must return a value for it exactly like any other element.
+ */
+const PROTOCOL_VERSION_RE = /^VERSION_[0-9_]+$/;
+
+/**
+ * Build the ordered `connect` values that positionally match the elements
+ * guacd listed in `args` — INCLUDING the leading protocol-version element.
+ *
+ * guacd validates that the client returns exactly one value per element it
+ * sent (`args` and `connect` must have the same arity). Dropping the version
+ * element shifts every value by one: guacd then reads the hostname as its
+ * protocol version, dials the port as if it were a hostname, and fails with
+ * the misleading "Client did not return the expected number of arguments." /
+ * "wrong security type?" errors. This matches the reference client
+ * (ConfiguredGuacamoleSocket), which echoes the negotiated version first.
  * Unlisted params are dropped; listed-but-unset params become empty strings.
  */
 export function buildConnectValues(argNames: string[], params: Record<string, string>): string[] {
-  return argNames.map((name) => params[name] ?? '');
+  return argNames.map((name, i) =>
+    i === 0 && PROTOCOL_VERSION_RE.test(name) ? name : (params[name] ?? ''),
+  );
 }
 
 /** Assemble the full parameter map for a target: protocol conn params + lockdown. */
@@ -243,12 +269,24 @@ export class GuacdClient {
               return;
             }
             if (instr.opcode !== 'args') continue;
-            const argNames = instr.args.slice(1); // drop leading VERSION element
+            // Keep the leading VERSION element: guacd requires one connect
+            // value per element it sent, version included.
+            const argNames = instr.args;
             write(formatInstruction('size', String(target.width), String(target.height), String(target.dpi)));
             write(formatInstruction('audio', ...AUDIO_MIMETYPES));
             write(formatInstruction('video'));
             write(formatInstruction('image', ...IMAGE_MIMETYPES));
-            write(formatInstruction('connect', ...buildConnectValues(argNames, params)));
+            const connectValues = buildConnectValues(argNames, params);
+            write(formatInstruction('connect', ...connectValues));
+            // The credential is now in the handshake. Drop every copy this
+            // adapter owns: the positional values and the parameter map that
+            // would otherwise stay reachable for the life of the connection.
+            // (The tunnel, which owns the credential's lifecycle, wipes the
+            // provider's object in place once connect() returns.) JS strings
+            // cannot be zeroed in place, so this bounds the plaintext's
+            // lifetime rather than claiming physical erasure.
+            connectValues.fill('');
+            scrubGuacParams(params);
             phase = 'await_ready';
             continue;
           }

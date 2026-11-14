@@ -44,6 +44,7 @@ function toLicense(row: LicenseRow): SoftwareLicense {
     description: row.description ?? '',
     os: row.os === 'windows' ? 'windows' : 'linux',
     hourlyRateUsd: Number(row.hourlyRateUsd),
+    maxDurationHours: row.maxDurationHours ?? null,
     ownerId: row.ownerId,
     ownerName: row.ownerName,
     status: row.status,
@@ -102,6 +103,32 @@ export class PrismaMarketplaceStore implements MarketplaceStore {
     }
   }
 
+  async listByOwner(ownerId: string): Promise<SoftwareLicense[]> {
+    try {
+      const rows = await this.db.softwareLicense.findMany({
+        where: { ownerId },
+        orderBy: { createdAt: 'asc' },
+      });
+      return rows.map(toLicense);
+    } catch (err) {
+      if (this.fallback && this.isConnErr(err)) return this.fallback.listByOwner(ownerId);
+      throw err;
+    }
+  }
+
+  async listRentalsByOwner(ownerId: string): Promise<RentalRecord[]> {
+    try {
+      const rows = await this.db.licenseRental.findMany({
+        where: { license: { ownerId } },
+        orderBy: { startedAt: 'desc' },
+      });
+      return rows.map(toRental);
+    } catch (err) {
+      if (this.fallback && this.isConnErr(err)) return this.fallback.listRentalsByOwner(ownerId);
+      throw err;
+    }
+  }
+
   async findById(id: string): Promise<SoftwareLicense | null> {
     try {
       const row = await this.db.softwareLicense.findUnique({ where: { id } });
@@ -124,6 +151,9 @@ export class PrismaMarketplaceStore implements MarketplaceStore {
           description: input.description,
           os: (input.os === 'windows' ? 'windows' : 'linux') as DbOs,
           hourlyRateUsd: new Prisma.Decimal(input.hourlyRateUsd),
+          ...(input.maxDurationHours !== undefined
+            ? { maxDurationHours: input.maxDurationHours }
+            : {}),
           status: DbLicenseStatus.available,
           encryptedCredentials: input.encryptedCredentials as unknown as Prisma.InputJsonValue,
           keyFingerprint: input.encryptedCredentials.keyFingerprint,

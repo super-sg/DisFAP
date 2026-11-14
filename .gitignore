@@ -1,9 +1,10 @@
-# deps / builds
-node_modules/
-dist/
+# Dependencies and generated build output (all workspaces)
+**/node_modules/
+**/dist/
+**/coverage/
 *.tsbuildinfo
 
-# env & secrets — never commit
+# Local environment files and secrets — never commit
 .env
 .env.*
 !.env.example
@@ -11,10 +12,10 @@ dist/
 *.pem
 *.key
 
-# dev credential-key directory (durable local key; *.pem already ignored)
+# Durable local credential key
 .dfap/
 
-# terraform
+# Terraform state and machine-specific configuration
 infra/terraform/**/.terraform/
 infra/terraform/**/*.tfstate
 infra/terraform/**/*.tfstate.backup
@@ -22,11 +23,19 @@ infra/terraform/**/*.tfvars
 !infra/terraform/**/*.tfvars.example
 infra/terraform/**/.terraform.lock.hcl
 
-# packer
+# Packer caches and machine-specific configuration
 infra/packer/**/packer_cache/
 infra/packer/**/*.auto.pkrvars.hcl
 
-# misc
+# Disposable evaluation credentials
+scripts/demo/.keys/
+
+# OS metadata, coverage output, logs, and editor temporary files
 .DS_Store
-coverage/
+Thumbs.db
 *.log
+*.swp
+*.swo
+*~
+*.orig
+*.rej

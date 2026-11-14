@@ -11,19 +11,19 @@ import styles from './Progress.module.css';
  */
 export const SESSION_PHASES = [
   {
-    label: 'Requesting isolated workspace',
+    label: 'Provisioning workspace',
     detail: 'Asking the cloud for a fresh, single-use virtual machine.',
   },
   {
-    label: 'Preparing the remote desktop',
+    label: 'Preparing secure session',
     detail: 'Booting the VM and installing its desktop environment. A first boot can take several minutes.',
   },
   {
-    label: 'Establishing encrypted channel',
+    label: 'Connecting to remote desktop',
     detail: 'The workspace is up and reachable — opening the pixel tunnel to the session broker.',
   },
   {
-    label: 'Connecting',
+    label: 'Waiting for the first frame',
     detail: 'Negotiating the remote display and waiting for the first frame.',
   },
 ] as const;

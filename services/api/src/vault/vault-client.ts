@@ -15,6 +15,12 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { VaultRequestError, WrapTokenConsumedError } from './errors.js';
+import { StaticTokenSource, type VaultTokenSource } from './vault-auth.js';
+
+// Re-exported so existing importers keep one import surface for the client.
+export { VaultAuthError, VaultRequestError, WrapTokenConsumedError } from './errors.js';
+
 export interface WrappedSecret {
   wrapToken: string;
   expiresAt: Date;
@@ -31,6 +37,17 @@ export interface VaultClient {
    * response-wrapped token that reads it back exactly once.
    */
   writeWrappedSecret(path: string, data: Record<string, string>, ttlSeconds: number): Promise<WrappedSecret>;
+  /**
+   * Wrap a READ of an existing secret, without writing it and without ever
+   * returning its plaintext to this process.
+   *
+   * This is the re-issuance primitive: Vault itself turns a KV read into a
+   * fresh single-use `wrap_info.token`, so a reconnecting client gets a new
+   * one-time handle while the credential stays in Vault. Returns null when the
+   * path no longer exists (revoked or expired), which the caller must treat as
+   * "no connection handle" — never as "connect without a credential".
+   */
+  wrapExistingSecret(path: string, ttlSeconds: number): Promise<WrappedSecret | null>;
   /** Consume a wrap token; throws if already used, expired, or unknown. */
   unwrap(wrapToken: string): Promise<UnwrappedSecret>;
   /** Best-effort revoke of a session's secret on teardown (idempotent). */
@@ -44,11 +61,27 @@ export interface VaultClient {
   read(path: string): Promise<Record<string, string> | null>;
 }
 
-export class WrapTokenConsumedError extends Error {
-  constructor() {
-    super('vault wrap token already consumed, expired, or unknown');
-    this.name = 'WrapTokenConsumedError';
+/**
+ * A KV path under the configured mount, restricted to plain segments.
+ *
+ * Paths are built from server-side ids, but they are interpolated into URLs and
+ * into a DELETE of `metadata/<path>` — a caller that ever supplied a `sid` with
+ * `..`, a leading slash, or an encoded separator could address (or destroy)
+ * another secret. Restricting to `[A-Za-z0-9._-]` per segment, first character
+ * alphanumeric, makes `..` and `/`-escape impossible in one place.
+ */
+export function assertSafeSecretPath(path: string): string {
+  if (typeof path !== 'string' || path.length === 0 || path.length > 256) {
+    throw new VaultRequestError('vault path is invalid');
   }
+  const segments = path.split('/');
+  if (segments.length > 8) throw new VaultRequestError('vault path is too deep');
+  for (const segment of segments) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(segment) || segment === '.' || segment === '..') {
+      throw new VaultRequestError('vault path is invalid');
+    }
+  }
+  return path;
 }
 
 // ---------------------------------------------------------------------------
@@ -69,10 +102,26 @@ export class FakeVaultClient implements VaultClient {
   constructor(private readonly now: () => number = () => Date.now()) {}
 
   async writeWrappedSecret(path: string, data: Record<string, string>, ttlSeconds: number): Promise<WrappedSecret> {
+    assertSafeSecretPath(path);
     const expiresAtMs = this.now() + ttlSeconds * 1000;
     this.kv.set(path, { data: { ...data }, expiresAtMs });
     const wrapToken = `s.fake.${randomBytes(18).toString('hex')}`;
     this.wraps.set(wrapToken, { path, data: { ...data }, expiresAtMs, used: false });
+    return { wrapToken, expiresAt: new Date(expiresAtMs) };
+  }
+
+  async wrapExistingSecret(path: string, ttlSeconds: number): Promise<WrappedSecret | null> {
+    assertSafeSecretPath(path);
+    const stored = this.kv.get(path);
+    if (!stored) return null;
+    if (stored.expiresAtMs <= this.now()) {
+      this.kv.delete(path);
+      return null;
+    }
+    // The handle cannot outlive the underlying secret.
+    const expiresAtMs = Math.min(stored.expiresAtMs, this.now() + ttlSeconds * 1000);
+    const wrapToken = `s.fake.${randomBytes(18).toString('hex')}`;
+    this.wraps.set(wrapToken, { path, data: { ...stored.data }, expiresAtMs, used: false });
     return { wrapToken, expiresAt: new Date(expiresAtMs) };
   }
 
@@ -84,11 +133,13 @@ export class FakeVaultClient implements VaultClient {
   }
 
   async revoke(path: string): Promise<void> {
+    assertSafeSecretPath(path);
     this.kv.delete(path);
     for (const [token, entry] of this.wraps) if (entry.path === path) this.wraps.delete(token);
   }
 
   async read(path: string): Promise<Record<string, string> | null> {
+    assertSafeSecretPath(path);
     const entry = this.kv.get(path);
     if (!entry) return null;
     if (entry.expiresAtMs <= this.now()) {
@@ -105,7 +156,15 @@ export class FakeVaultClient implements VaultClient {
 
 export interface HttpVaultOptions {
   addr: string; // e.g. https://vault.internal:8200
-  token: string; // the API's OWN Vault token (from AppRole/IAM auth) — least privilege
+  /**
+   * The API's OWN Vault credential — least privilege, never root.
+   *
+   * Either a static token (long-lived; supplied via `VAULT_TOKEN` /
+   * `VAULT_TOKEN_FILE`) or a `VaultTokenSource` such as `AppRoleTokenSource`,
+   * which logs in and refreshes short-lived tokens itself.
+   */
+  token?: string;
+  tokenSource?: VaultTokenSource;
   mount?: string; // KV v2 mount, default "secret"
   namespace?: string; // Vault Enterprise namespace (optional)
   /** Per-request timeout in ms. Default 5000. */
@@ -114,26 +173,19 @@ export interface HttpVaultOptions {
   fetchImpl?: typeof fetch;
 }
 
-/** A Vault HTTP call failed. Carries only a status — never a token or body. */
-export class VaultRequestError extends Error {
-  readonly status?: number;
-  constructor(message: string, status?: number) {
-    super(message);
-    this.name = 'VaultRequestError';
-    if (status !== undefined) this.status = status;
-  }
-}
-
 const asRecord = (v: unknown): Record<string, unknown> =>
   typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {};
 
 /**
  * Real HTTP adapter over HashiCorp Vault's KV v2 + response-wrapping.
  *
- *  - The API's own token is used for writes/revokes (never a client-supplied
- *    token); the single-use wrap token is used ONLY for unwrap.
+ *  - The API's own credential is used for writes/revokes/reads (never a
+ *    client-supplied token); the single-use wrap token is used ONLY for unwrap.
  *  - `X-Vault-Wrap-TTL` makes Vault return `wrap_info.token` instead of the
  *    data, so the secret never returns to the caller at write time.
+ *  - A 403 invalidates a refreshable token and retries the request exactly once,
+ *    so an expired AppRole lease is not a user-visible failure — but a policy
+ *    denial (which re-fails) still surfaces as an error.
  *  - Requests are time-bounded. Errors carry a status only — a secret value or
  *    a token is never placed in an error message (or a log line).
  *
@@ -142,7 +194,7 @@ const asRecord = (v: unknown): Record<string, unknown> =>
  */
 export class HttpVaultClient implements VaultClient {
   private readonly addr: string;
-  private readonly token: string;
+  private readonly tokens: VaultTokenSource;
   private readonly mount: string;
   private readonly namespace?: string;
   private readonly timeoutMs: number;
@@ -150,13 +202,33 @@ export class HttpVaultClient implements VaultClient {
 
   constructor(opts: HttpVaultOptions) {
     if (!opts.addr) throw new VaultRequestError('vault addr is required');
-    if (!opts.token) throw new VaultRequestError('vault token is required');
+    if (!opts.token && !opts.tokenSource) throw new VaultRequestError('vault token is required');
+    if (opts.token && opts.tokenSource) {
+      throw new VaultRequestError('configure either a vault token or a token source, not both');
+    }
     this.addr = opts.addr.replace(/\/+$/, '');
-    this.token = opts.token;
+    this.tokens = opts.tokenSource ?? new StaticTokenSource(opts.token ?? '');
     this.mount = opts.mount ?? 'secret';
     this.timeoutMs = opts.requestTimeoutMs ?? 5000;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     if (opts.namespace) this.namespace = opts.namespace;
+  }
+
+  /**
+   * Send a request with the service's own credential. A 403 triggers one
+   * re-authentication: an AppRole token that expired between `get()` and the
+   * request would otherwise fail spuriously. A static token cannot change, so
+   * the retry is skipped and the original 403 is returned.
+   */
+  private async authedSend(url: string, init: RequestInit): Promise<Response> {
+    const token = await this.tokens.get();
+    const res = await this.send(url, init, token);
+    if (res.status === 403) {
+      this.tokens.invalidate();
+      const fresh = await this.tokens.get();
+      if (fresh !== token) return this.send(url, init, fresh);
+    }
+    return res;
   }
 
   private async send(url: string, init: RequestInit, token: string): Promise<Response> {
@@ -189,18 +261,15 @@ export class HttpVaultClient implements VaultClient {
   }
 
   async writeWrappedSecret(path: string, data: Record<string, string>, ttlSeconds: number): Promise<WrappedSecret> {
+    assertSafeSecretPath(path);
     if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
       throw new VaultRequestError('vault wrap ttl must be a positive number');
     }
-    const res = await this.send(
-      `${this.addr}/v1/${this.mount}/data/${path}`,
-      {
-        method: 'POST',
-        headers: { 'X-Vault-Wrap-TTL': String(ttlSeconds), 'X-Vault-Request': 'true' },
-        body: JSON.stringify({ data }),
-      },
-      this.token,
-    );
+    const res = await this.authedSend(`${this.addr}/v1/${this.mount}/data/${path}`, {
+      method: 'POST',
+      headers: { 'X-Vault-Wrap-TTL': String(ttlSeconds), 'X-Vault-Request': 'true' },
+      body: JSON.stringify({ data }),
+    });
     if (!res.ok) throw new VaultRequestError(`vault write failed (${res.status})`, res.status);
     const wrapInfo = asRecord((await this.jsonBody(res))['wrap_info']);
     const token = wrapInfo['token'];
@@ -212,13 +281,38 @@ export class HttpVaultClient implements VaultClient {
     return { wrapToken: token, expiresAt: new Date(Date.now() + ttl * 1000) };
   }
 
+  /**
+   * `GET` the KV path with `X-Vault-Wrap-TTL`: Vault returns `wrap_info` and
+   * never the secret, so re-issuing a handle does not pull plaintext into the
+   * control plane. A 404 means the session secret is gone (revoked/expired).
+   */
+  async wrapExistingSecret(path: string, ttlSeconds: number): Promise<WrappedSecret | null> {
+    assertSafeSecretPath(path);
+    if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+      throw new VaultRequestError('vault wrap ttl must be a positive number');
+    }
+    const res = await this.authedSend(`${this.addr}/v1/${this.mount}/data/${path}`, {
+      method: 'GET',
+      headers: { 'X-Vault-Wrap-TTL': String(ttlSeconds), 'X-Vault-Request': 'true' },
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new VaultRequestError(`vault read failed (${res.status})`, res.status);
+    const body = await this.jsonBody(res);
+    const wrapInfo = asRecord(body['wrap_info']);
+    const token = wrapInfo['token'];
+    if (typeof token !== 'string' || token === '') {
+      throw new VaultRequestError('vault did not return a wrap token');
+    }
+    const ttlRaw = wrapInfo['ttl'];
+    const ttl = typeof ttlRaw === 'number' && ttlRaw > 0 ? ttlRaw : ttlSeconds;
+    return { wrapToken: token, expiresAt: new Date(Date.now() + ttl * 1000) };
+  }
+
   async unwrap(wrapToken: string): Promise<UnwrappedSecret> {
     if (!wrapToken) throw new WrapTokenConsumedError();
-    const res = await this.send(
-      `${this.addr}/v1/sys/wrapping/unwrap`,
-      { method: 'POST', headers: { 'X-Vault-Token': wrapToken } },
-      wrapToken,
-    );
+    // Deliberately NOT `authedSend`: the wrap token IS the credential here, and
+    // it must never be replaced by (or confused with) the service's own token.
+    const res = await this.send(`${this.addr}/v1/sys/wrapping/unwrap`, { method: 'POST' }, wrapToken);
     if (res.status === 400 || res.status === 403 || res.status === 404) {
       throw new WrapTokenConsumedError();
     }
@@ -234,7 +328,8 @@ export class HttpVaultClient implements VaultClient {
   }
 
   async revoke(path: string): Promise<void> {
-    const res = await this.send(`${this.addr}/v1/${this.mount}/metadata/${path}`, { method: 'DELETE' }, this.token);
+    assertSafeSecretPath(path);
+    const res = await this.authedSend(`${this.addr}/v1/${this.mount}/metadata/${path}`, { method: 'DELETE' });
     // 404 ⇒ already gone (idempotent). Anything else is a real, retryable error.
     if (!res.ok && res.status !== 404) {
       throw new VaultRequestError(`vault revoke failed (${res.status})`, res.status);
@@ -242,7 +337,8 @@ export class HttpVaultClient implements VaultClient {
   }
 
   async read(path: string): Promise<Record<string, string> | null> {
-    const res = await this.send(`${this.addr}/v1/${this.mount}/data/${path}`, { method: 'GET' }, this.token);
+    assertSafeSecretPath(path);
+    const res = await this.authedSend(`${this.addr}/v1/${this.mount}/data/${path}`, { method: 'GET' });
     if (res.status === 404) return null;
     if (!res.ok) throw new VaultRequestError(`vault read failed (${res.status})`, res.status);
     const payload = asRecord((await this.jsonBody(res))['data']);

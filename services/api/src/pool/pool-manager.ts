@@ -171,27 +171,40 @@ export class PoolManager {
 
     const launched = await this.cloud.launchInstance(spec);
 
-    const created = await this.db.poolInstance.create({
-      data: {
-        templateId,
-        region: spec.region,
-        az: launched.az,
-        cloudInstanceId: launched.cloudInstanceId,
-        // The connect host the broker dials. In-VPC deployments reach the
-        // instance's private IP, but the local evaluation topology runs the
-        // control plane OUTSIDE the VPC, so a public IP (when the instance has
-        // one) is the only reachable address. Prefer it when present.
-        privateIp: launched.publicIp ?? launched.privateIp ?? null,
-        state: 'provisioning',
-        claimedBySessionId: sessionId,
-        ...(spec.securityGroupId !== undefined ? { securityGroupId: spec.securityGroupId } : {}),
-        launchedAt: launched.launchedAt,
-        claimedAt: this.now(),
-        // Hard deadline stamped at creation — mirrors the dfap:expires_at tag.
-        expiresAt: spec.expiresAt,
-        hourlyCostUsd,
-      },
-    });
+    // The VM is billing from this moment, and the row we are about to write is
+    // the only thing that bounds its life (`expires_at`) or lets the reaper see
+    // it at all. If that write fails we terminate the instance immediately: the
+    // reaper's orphan path would eventually catch a DisFAP-tagged stranger, but
+    // only after ORPHAN_GRACE_MS, and an untracked running instance is exactly
+    // what the pool exists to prevent. Terminate first, then rethrow the
+    // database error so the caller still fails the session.
+    let created: { id: string };
+    try {
+      created = await this.db.poolInstance.create({
+        data: {
+          templateId,
+          region: spec.region,
+          az: launched.az,
+          cloudInstanceId: launched.cloudInstanceId,
+          // The connect host the broker dials. In-VPC deployments reach the
+          // instance's private IP, but the local evaluation topology runs the
+          // control plane OUTSIDE the VPC, so a public IP (when the instance has
+          // one) is the only reachable address. Prefer it when present.
+          privateIp: launched.publicIp ?? launched.privateIp ?? null,
+          state: 'provisioning',
+          claimedBySessionId: sessionId,
+          ...(spec.securityGroupId !== undefined ? { securityGroupId: spec.securityGroupId } : {}),
+          launchedAt: launched.launchedAt,
+          claimedAt: this.now(),
+          // Hard deadline stamped at creation — mirrors the dfap:expires_at tag.
+          expiresAt: spec.expiresAt,
+          hourlyCostUsd,
+        },
+      });
+    } catch (err) {
+      await this.cloud.terminateInstance(launched.cloudInstanceId).catch(() => undefined);
+      throw err;
+    }
 
     // Build from the launch spec + created id (not the create result's fields),
     // so ORM field-casing never matters here.

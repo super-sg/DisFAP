@@ -35,7 +35,10 @@ env.DFAP_ENV = env.DFAP_ENV || 'development';
 env.API_PORT = env.API_PORT || '3000';
 env.BROKER_PORT = env.BROKER_PORT || '8080';
 env.BROKER_WS_PATH = env.BROKER_WS_PATH || '/tunnel';
-env.BROKER_URL = env.BROKER_URL || 'ws://localhost:8080/tunnel';
+// Base URL only — the browser appends the broker WS path (/tunnel) itself
+// (apps/web/src/session/dfap-tunnel.ts). Including /tunnel here would make the
+// client dial /tunnel/tunnel, which the broker does not serve.
+env.BROKER_URL = env.BROKER_URL || 'ws://localhost:8080';
 env.DFAP_SIGNING_KEYS = env.DFAP_SIGNING_KEYS || 'kdev:gq12DUvetTrtZXQvojb2GIHtv9G9BBkA65jLOQTSTmc=';
 env.DFAP_SIGNING_KID = env.DFAP_SIGNING_KID || 'kdev';
 env.CLOUD_PROVIDER = env.CLOUD_PROVIDER || 'fake';

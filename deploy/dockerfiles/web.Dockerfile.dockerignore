@@ -15,4 +15,4 @@
 deploy/**
 !deploy/web
 !deploy/web/nginx.conf
-DisFAP Flow*.png
+docs/architecture/assets/disfap-flow.png

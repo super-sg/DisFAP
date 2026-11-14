@@ -225,8 +225,9 @@ Be aware these are not yet closed. They are design seams, not mysteries:
 
 | Gap | Detail |
 |---|---|
-| **OS mismatch** | The Packer image is **Linux** (Ubuntu 24.04 + xrdp + a locked `session` user). The marketplace seeds/templates are **Windows** (`tmpl_win_rdp`). A Linux session needs a Linux workspace template + marketplace entry. |
-| **In-guest credential path** | The Packer README says the control plane "sets a per-session password via SSM at claim time", but no code issues that SSM command yet. The new pre-boot injector seals a blob expecting an in-image `dfap-preboot.service` to unseal it — that unit does not exist yet. So the `session` user cannot log in. |
+| **OS mismatch** | The AWS evaluation path now rejects non-Linux/RDP templates. The selected listing must use the Linux RDP template; Windows listings cannot be launched into the Linux demo image. |
+| **In-guest credential path** | Stock-AMI cloud-init accepts only a fresh DisFAP demo credential. It refuses the decrypted reusable marketplace credential rather than placing it in EC2 user data. A licensed software session therefore still needs the production guest-provisioning path or a separately approved credential bridge. |
+| **Stock AMI networking** | The default private session subnet has no NAT and default-deny egress. A stock Ubuntu AMI cannot download XFCE/xrdp there; use a prebuilt compatible AMI or an explicitly approved temporary egress path. |
 | **Vault** | The guacd credential handshake needs a reachable, unsealed Vault (`HttpVaultClient`); Phase-0 compose has one, a local-only test does not. |
 | **Packer build network** | Not provisioned by `phase0`; see §3. |
 

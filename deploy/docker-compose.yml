@@ -2,8 +2,9 @@
 # DisFAP — Phase-0 all-in-one deployment (docs/architecture.md §"Phase-0")
 # =============================================================================
 # Everything runs on ONE t4g.small (arm64/Graviton) in Docker Compose:
-#   API, broker, guacd, single-node Vault, Postgres, Redis, Caddy (TLS).
-# No pool (cold launches), no NAT Gateway, AWS Budget alarm at $50.
+#   API (which hosts the broker in-process), guacd, single-node Vault,
+#   Postgres, Redis, Caddy (TLS). No pool (cold launches), no NAT Gateway,
+#   AWS Budget alarm at $50.
 #
 # SECURITY POSTURE OF THIS FILE (see comments inline):
 #   - Caddy is the ONLY service that publishes host ports (443 + 80).
@@ -32,9 +33,9 @@ networks:
 
   # `internal` is a closed network: `internal: true` means Docker attaches NO
   # gateway, so nothing here can reach the internet OR be reached from the host.
-  # The stateful/secret services live ONLY here. api/broker straddle both
+  # The stateful/secret services live ONLY here. The api straddles both
   # networks: private data-plane access on `internal`, controlled egress on
-  # `edge`.
+  # `edge` (Stripe/AWS/guacd).
   internal:
     driver: bridge
     internal: true
@@ -139,6 +140,10 @@ services:
     volumes:
       - vaultdata:/vault/data
       - ./vault/config.hcl:/vault/config/config.hcl:ro
+      # One-time bootstrap assets (least-privilege policies + AppRole setup).
+      # Not loaded by the server; mounted so `make vault-bootstrap` can run
+      # inside the container without copying files onto the host.
+      - ./vault:/vault/bootstrap:ro
     healthcheck:
       # Exit 0 = unsealed+active, exit 2 = sealed. Both mean "process is fine";
       # anything else is genuinely unhealthy.
@@ -166,11 +171,31 @@ services:
     environment:
       # Fixed intra-compose wiring (self-documenting; overrides any .env drift).
       NODE_ENV: production
+      API_PORT: "3000"                              # Caddy -> api:3000
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
       VAULT_ADDR: http://vault:8200
+      # The API's Vault identity is an AppRole (see vault/bootstrap.sh). The
+      # root token used to initialise Vault belongs to the operator, never to
+      # this process.
+      VAULT_APPROLE_ROLE_ID: ${VAULT_APPROLE_ROLE_ID:-}
+      VAULT_APPROLE_SECRET_ID: ${VAULT_APPROLE_SECRET_ID:-}
+      # Vault has no published port and is reachable only on the `internal`
+      # bridge. This acknowledges that the hop is cleartext; production beyond
+      # a single host must set VAULT_ADDR=https://... instead.
+      VAULT_ALLOW_HTTP: "true"
+      # The broker runs IN THIS PROCESS (createBroker in main()), so it reads
+      # the same guacd settings from this container.
+      BROKER_PORT: "8080"
+      BROKER_WS_PATH: /tunnel
       GUACD_HOST: guacd
       GUACD_PORT: "4822"
+      GUACD_TLS: "false"                            # private bridge only
+      # Explicit acknowledgement that the credential crosses a cleartext
+      # socket. Required in production unless GUACD_TLS=true + GUACD_CA (+
+      # client cert/key). guacd publishes no host port, so the plaintext never
+      # leaves this Docker host; that is the ONLY justification.
+      GUACD_ALLOW_CLEARTEXT: "true"
     depends_on:
       postgres:
         condition: service_healthy
@@ -180,43 +205,20 @@ services:
         condition: service_started        # api starts even if Vault is sealed;
                                             # it fails session CREATION with a
                                             # clear error (docs/security.md).
-    # No `ports:` — reached only via Caddy at https://<host>/api/*.
+    # No `ports:` — reached only via Caddy at https://<host>/api/* and
+    # wss://<host>/tunnel.
 
   # ===========================================================================
-  # broker — session gateway (services/broker): token redeem, filter, tunnel.
+  # broker — NOT a separate service in this stack.
   # ===========================================================================
-  # Receives the browser WebSocket via Caddy (/tunnel), reaches guacd on `edge`
-  # and Redis/Vault/api on `internal`. NOT published.
-  broker:
-    build:
-      context: ..
-      dockerfile: deploy/dockerfiles/broker.Dockerfile
-    restart: unless-stopped
-    networks:
-      - internal
-      - edge
-    env_file:
-      - .env
-    environment:
-      NODE_ENV: production
-      BROKER_PORT: "8080"
-      BROKER_WS_PATH: /tunnel
-      GUACD_HOST: guacd
-      GUACD_PORT: "4822"
-      GUACD_TLS: "false"                  # broker<->guacd stays on the private
-                                          # bridge; mTLS is a production concern.
-      REDIS_URL: ${REDIS_URL}
-      VAULT_ADDR: http://vault:8200
-    depends_on:
-      guacd:
-        condition: service_started
-      redis:
-        condition: service_healthy
-      vault:
-        condition: service_started
-      api:
-        condition: service_started        # control-plane resolver + cred provider
-    # No `ports:` — reached only via Caddy at wss://<host>/tunnel.
+  # The broker is a library (services/broker) that the API hosts in-process:
+  # it needs the control plane's Prisma session resolver and Vault credential
+  # provider, neither of which can be constructed from the compose file alone.
+  # A container built from deploy/dockerfiles/broker.Dockerfile therefore
+  # refuses to start (it has no resolver), which is deliberate: the earlier
+  # version booted with empty in-memory stubs, answered /healthz 200, and
+  # rejected every tunnel. Splitting the broker onto its own host requires an
+  # authenticated resolver endpoint first — see docs/security/architecture.md.
 
   # ===========================================================================
   # web — browser client (apps/web): React + guacamole-common-js, built to a
@@ -242,7 +244,7 @@ services:
   # ===========================================================================
   #   /            -> web:80    (static SPA)
   #   /api/*       -> api:3000  (control plane)
-  #   /tunnel      -> broker:8080 (WebSocket; Caddy v2 auto-upgrades)
+  #   /tunnel      -> api:8080  (in-process broker WebSocket; Caddy auto-upgrades)
   caddy:
     image: caddy:2.8-alpine
     restart: unless-stopped
@@ -261,4 +263,3 @@ services:
     depends_on:
       - web
       - api
-      - broker

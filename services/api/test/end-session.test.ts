@@ -30,6 +30,7 @@ function sessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
     firstPixelAt: FIXED,
     connectedAt: FIXED,
     disconnectedAt: null,
+    disconnectDeadlineAt: null,
     endedAt: null,
     endReason: null,
     billableSeconds: null,
@@ -78,6 +79,7 @@ function harness(initial: SessionRecord): Harness {
     issue: async () => {
       throw new Error('unused');
     },
+    reissue: async () => null,
     revoke: vi.fn(async () => undefined),
     pathFor: (sid) => `sessions/${sid}/rdp`,
   };

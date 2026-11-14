@@ -6,6 +6,8 @@ import { verifyConnectToken, type Keyring } from '@disfap/broker/src/session-tok
 import { InMemoryNonceStore } from '@disfap/broker/src/nonce-store.js';
 
 import { createSession, type CreateSessionDeps, type SessionPool } from '../src/sessions/create-session.js';
+import { issueConnectHandle } from '../src/sessions/connect-handle.js';
+import type { PreBootCredential } from '../src/cloud/disk-injector.js';
 import type { SessionRepo, SessionRecord, CreateSessionData, SessionPatch, TemplateRepo, TemplateRecord, EventRecorder, AuditRecorder, CallerPrincipal, InstanceRepo } from '../src/ports.js';
 import type { QuotaStore } from '../src/billing/quota.js';
 import { VaultCredentialIssuer } from '../src/credentials/credential-issuer.js';
@@ -19,6 +21,12 @@ const NOW_S = Math.floor(FIXED.getTime() / 1000);
 
 function keyring(): Keyring {
   return { keys: new Map([['k_cur', randomBytes(32)]]), signingKid: 'k_cur' };
+}
+
+/** The capability's connection id — the wrap cache's key beside the session id. */
+function jtiOf(token: string): string {
+  const payload = JSON.parse(Buffer.from(token.split('.')[2]!, 'base64url').toString('utf8')) as { jti: string };
+  return payload.jti;
 }
 
 class InMemorySessionRepo implements SessionRepo {
@@ -39,6 +47,7 @@ class InMemorySessionRepo implements SessionRepo {
       firstPixelAt: null,
       connectedAt: null,
       disconnectedAt: null,
+      disconnectDeadlineAt: null,
       endedAt: null,
       endReason: null,
       billableSeconds: null,
@@ -184,8 +193,8 @@ describe('createSession', () => {
 
     const result = await createSession(principal, { templateId: 'tpl_1' }, deps);
 
-    // Resolver hands the broker the wrap token; provider unwraps it read-once.
-    const wrapToken = wrapCache.take(result.sessionId);
+    // Resolver hands the broker the wrap token bound to this capability's jti.
+    const wrapToken = wrapCache.take(result.sessionId, jtiOf(result.token));
     expect(wrapToken).toBeTruthy();
     const provider = new VaultCredentialProvider(vault);
     const cred = await provider.fetch(result.sessionId, wrapToken!);
@@ -265,7 +274,7 @@ describe('createSession', () => {
     expect(markState).toHaveBeenCalledWith('pi_1', 'terminated', expect.any(Date));
   });
 
-  it('defers readiness: stays allocating with instance + vault path, and the wrap token outlives a long boot', async () => {
+  it('defers readiness: stays allocating, and a fresh handle can be issued after a long boot', async () => {
     const kr = keyring();
     const vault = new FakeVaultClient(() => FIXED.getTime());
     let clock = FIXED.getTime();
@@ -281,10 +290,86 @@ describe('createSession', () => {
     expect(row.instanceId).toBe('pi_1');
     expect(row.vaultCredPath).toContain(result.sessionId);
 
-    // Five minutes later (well past the old 90 s wrap-cache TTL) the staged
-    // wrap token is still available, so a client that connects once the
-    // readiness loop reports `ready` can still redeem it.
+    // The initial capability is deliberately short-lived: five minutes later
+    // its wrap handle is gone. Recovery is to ask for a fresh one, which Vault
+    // derives from the persisted secret — not to keep a long-lived handle
+    // around. This is the reconnection contract.
     clock = FIXED.getTime() + 5 * 60_000;
-    expect(wrapCache.take(result.sessionId)).toBeTruthy();
+    expect(wrapCache.take(result.sessionId, jtiOf(result.token))).toBeNull();
+
+    repo.rows.get(result.sessionId)!.state = 'ready';
+    const fresh = await issueConnectHandle(row, {
+      credentialIssuer: deps.credentialIssuer,
+      wrapCache,
+      keyring: kr,
+      brokerUrl: deps.config.brokerUrl,
+      connectTokenTtlS: deps.config.connectTokenTtlS,
+      credentialTtlS: deps.config.credentialTtlS,
+      now: () => new Date(clock),
+    });
+    expect(fresh).toBeTruthy();
+    expect(wrapCache.take(result.sessionId, jtiOf(fresh!.token))).toBeTruthy();
+  });
+
+  it('marks a generated base-workspace credential demo-only for the injector', async () => {
+    const kr = keyring();
+    const seen: PreBootCredential[] = [];
+    const pool: SessionPool = {
+      claim: async (templateId, _sessionId, preBoot) => {
+        if (preBoot) seen.push(preBoot);
+        return {
+          coldLaunched: true,
+          instance: {
+            id: 'pi_1',
+            cloudInstanceId: 'i-fake-1',
+            templateId,
+            region: 'us-east-1',
+            az: 'us-east-1a',
+            privateIp: '10.0.0.7',
+            state: 'provisioning',
+            expiresAt: new Date('2026-07-22T20:00:00Z'),
+            hourlyCostUsd: 0.0168,
+          },
+        };
+      },
+    };
+    const deps = buildDeps(kr, new FakeVaultClient(() => FIXED.getTime()), new InMemoryWrapTokenCache(() => FIXED.getTime()), { pool });
+
+    await createSession(principal, { templateId: 'tpl_1' }, deps);
+
+    expect(seen[0]?.demoOnly).toBe(true);
+  });
+
+  it('does NOT mark a marketplace credential demo-only unless the listing declares it', async () => {
+    const kr = keyring();
+    const seen: PreBootCredential[] = [];
+    const pool: SessionPool = {
+      claim: async (templateId, _sessionId, preBoot) => {
+        if (preBoot) seen.push(preBoot);
+        return {
+          coldLaunched: true,
+          instance: {
+            id: 'pi_1',
+            cloudInstanceId: 'i-fake-1',
+            templateId,
+            region: 'us-east-1',
+            az: 'us-east-1a',
+            privateIp: '10.0.0.7',
+            state: 'provisioning',
+            expiresAt: new Date('2026-07-22T20:00:00Z'),
+            hourlyCostUsd: 0.0168,
+          },
+        };
+      },
+    };
+    const credential = { username: 'licensed-user', password: 'reusable-pass' };
+
+    // No explicit declaration → the evaluation injector must refuse it.
+    await createSession(principal, { templateId: 'tpl_1', credential }, buildDeps(kr, new FakeVaultClient(() => FIXED.getTime()), new InMemoryWrapTokenCache(() => FIXED.getTime()), { pool }));
+    expect(seen[0]?.demoOnly).toBe(false);
+
+    // Explicit declaration → it may be installed on the disposable demo VM.
+    await createSession(principal, { templateId: 'tpl_1', credential, demoOnly: true }, buildDeps(kr, new FakeVaultClient(() => FIXED.getTime()), new InMemoryWrapTokenCache(() => FIXED.getTime()), { pool }));
+    expect(seen[1]?.demoOnly).toBe(true);
   });
 });

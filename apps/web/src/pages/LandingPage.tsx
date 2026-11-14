@@ -1,77 +1,72 @@
-import type { JSX } from 'react';
+import type { JSX, ReactNode } from 'react';
+import { IconArrowRight, IconBox, IconCpu, IconKey, IconLaptop, IconLayers, IconLock, IconServer, IconShield, IconTerminal } from '../ui/Icons.js';
 import styles from './LandingPage.module.css';
 
 export interface LandingPageProps {
   onNavigate: (page: 'dashboard' | 'workspaces') => void;
 }
 
-const FEATURES = [
+const FEATURES: { icon: ReactNode; title: string; desc: string }[] = [
   {
-    icon: '🖥',
-    title: 'Pixel-Only Sessions',
-    desc: 'Rendered pixels over HTML5 canvas. No file transfer, no clipboard, no drive redirection — enforced in four independent layers.',
+    icon: <IconLaptop size={20} />,
+    title: 'Pixel-Only Isolated Sessions',
+    desc: 'Rendered pixels streamed over HTML5 canvas. No file transfer, no clipboard bridging, no drive redirection — enforced across four independent layers.',
   },
   {
-    icon: '🔥',
-    title: 'Ephemeral VMs',
-    desc: 'Every session boots a fresh, hardened VM from a golden image. Used once, then destroyed. Never reused across sessions.',
+    icon: <IconServer size={20} />,
+    title: 'Ephemeral Worker Instances',
+    desc: 'Sessions run on provisioned workers. Ending a session requests instance termination, with a lifecycle reaper as a recovery path.',
   },
   {
-    icon: '🛡',
-    title: 'Zero Trust Credentials',
-    desc: 'Session credentials never transit the client. The browser receives an opaque 60-second handle — Vault resolves the rest server-side.',
+    icon: <IconKey size={20} />,
+    title: 'Zero-Trust Credential Sealing',
+    desc: 'Desktop credentials stay server-side. The browser receives a short-lived, single-use connection handle while Vault supplies credentials to the worker path.',
   },
   {
-    icon: '📼',
-    title: 'Tamper-Evident Audit',
-    desc: 'Session recordings streamed to WORM storage with hash-chained integrity. Removal or alteration of any frame is cryptographically detectable.',
+    icon: <IconShield size={20} />,
+    title: 'Session Lifecycle Tracking',
+    desc: 'The control plane records session state and teardown events. Full session history and end-to-end recording are not exposed in this frontend.',
   },
-] as const;
+];
 
 const LAYERS = [
   {
     label: 'Layer 1',
     title: 'guacd Parameters',
-    desc: 'Copy, paste, drive, print disabled server-side. Client never influences connection params.',
+    desc: 'Copy, paste, drive, and print channels disabled server-side. The client cannot influence connection parameters.',
   },
   {
     label: 'Layer 2',
-    title: 'Instruction Filter',
-    desc: 'Strict allowlist on the broker. Only mouse, key, size, sync pass. File/clipboard streams are dropped and logged.',
+    title: 'RSA-4096 Provider',
+    desc: 'Owner credentials sealed at ingest via software-backed RSA-4096. Plaintext is never stored in PostgreSQL.',
   },
   {
     label: 'Layer 3',
-    title: 'Guest OS Policy',
-    desc: 'Channel redirection disabled in the hardened image via OS-level group policy. Survives a compromised broker.',
+    title: 'Two-Thread Orchestrator',
+    desc: 'Parallel worker provisioning and credential staging in Vault. Emits a short-lived, single-use capability handle.',
   },
   {
     label: 'Layer 4',
-    title: 'Browser Client',
-    desc: 'No file/clipboard handlers attached. Drag, drop, context menu, text selection are all neutralised in the DOM.',
+    title: 'Browser Client Sandbox',
+    desc: 'Input overlay captures mouse and keystrokes while DOM drag-and-drop, text selection, and context menus are neutralised.',
   },
 ] as const;
 
 export function LandingPage({ onNavigate }: LandingPageProps): JSX.Element {
   return (
-    <main className={styles.page}>
-      {/* ── Hero ────────────────────────────────────────────────────────────── */}
+    <div className={styles.page}>
       <section className={styles.hero}>
-        <div className={styles.heroGrid} aria-hidden="true" />
-        <div className={styles.heroGlow} aria-hidden="true" />
-
         <span className={styles.heroBadge}>
           <span className={styles.heroBadgeDot} aria-hidden="true" />
-          Secure by construction
+          Zero-Trust Remote Execution Architecture
         </span>
 
         <h1 className={styles.heroTitle}>
-          Workspaces that{' '}
-          <span className={styles.heroGradientText}>never leak data</span>
+          Remote workspaces with <span className={styles.heroTitleAccent}>controlled data paths</span>
         </h1>
 
         <p className={styles.heroSub}>
-          Contractors, auditors, and third parties work on sensitive applications through the browser.
-          The endpoint never holds anything but pixels.
+          Run applications in a remote workspace. The browser receives the pixel stream and sends input; broker and client controls block file and clipboard channels.
         </p>
 
         <button
@@ -80,11 +75,10 @@ export function LandingPage({ onNavigate }: LandingPageProps): JSX.Element {
           type="button"
         >
           Launch a workspace
-          <span className={styles.heroCtaArrow} aria-hidden="true">→</span>
+          <IconArrowRight size={16} />
         </button>
       </section>
 
-      {/* ── Stats ───────────────────────────────────────────────────────────── */}
       <div className={styles.statsBar}>
         <div className={styles.stat}>
           <div className={styles.statValue}>4</div>
@@ -92,25 +86,26 @@ export function LandingPage({ onNavigate }: LandingPageProps): JSX.Element {
         </div>
         <div className={styles.stat}>
           <div className={styles.statValue}>60s</div>
-          <div className={styles.statLabel}>Token Lifetime</div>
+          <div className={styles.statLabel}>Token TTL</div>
         </div>
         <div className={styles.stat}>
-          <div className={styles.statValue}>5</div>
-          <div className={styles.statLabel}>Teardown Layers</div>
+          <div className={styles.statValue}>3389</div>
+          <div className={styles.statLabel}>xrdp Isolation</div>
         </div>
         <div className={styles.stat}>
           <div className={styles.statValue}>0</div>
-          <div className={styles.statLabel}>Data Channels</div>
+          <div className={styles.statLabel}>Client Binaries</div>
         </div>
       </div>
 
-      {/* ── Features ────────────────────────────────────────────────────────── */}
       <section className={styles.features}>
-        <span className={styles.sectionLabel}>◆ Platform</span>
-        <h2 className={styles.sectionTitle}>Built for zero-trust access</h2>
-        <p className={styles.sectionSub}>
-          Every guarantee is enforced in code — not configured in a single place. Each layer assumes the previous ones have failed.
-        </p>
+        <div className={styles.sectionHeader}>
+          <span className={styles.sectionLabel}>◆ Architecture</span>
+          <h2 className={styles.sectionTitle}>Built for Zero-Trust Remote Access</h2>
+          <p className={styles.sectionSub}>
+            Pixel-stream restrictions are implemented in the broker and browser. Cloud identity, network, and key configuration must still be validated per deployment.
+          </p>
+        </div>
 
         <div className={styles.featureGrid}>
           {FEATURES.map((f) => (
@@ -123,32 +118,30 @@ export function LandingPage({ onNavigate }: LandingPageProps): JSX.Element {
         </div>
       </section>
 
-      {/* ── Security Layers ─────────────────────────────────────────────────── */}
-      <section className={styles.security}>
-        <div className={styles.securityInner}>
+      <section className={styles.features}>
+        <div className={styles.sectionHeader}>
           <span className={styles.sectionLabel}>◆ Security Model</span>
-          <h2 className={styles.sectionTitle}>Four layers, zero trust</h2>
+          <h2 className={styles.sectionTitle}>Four Defense-in-Depth Layers</h2>
           <p className={styles.sectionSub}>
-            No data channel to the client — enforced independently at every level so no single misconfiguration opens a path.
+            No outbound data channel to the client — enforced independently at protocol, cryptographic, orchestrator, and browser levels.
           </p>
+        </div>
 
-          <div className={styles.layerGrid}>
-            {LAYERS.map((l, i) => (
-              <div key={l.label} className={styles.layerCard}>
-                <span className={styles.layerNumber} aria-hidden="true">{i + 1}</span>
-                <div className={styles.layerLabel}>{l.label}</div>
-                <h3 className={styles.layerTitle}>{l.title}</h3>
-                <p className={styles.layerDesc}>{l.desc}</p>
-              </div>
-            ))}
-          </div>
+        <div className={styles.layerGrid}>
+          {LAYERS.map((l, i) => (
+            <div key={l.label} className={styles.layerCard}>
+              <span className={styles.layerNumber} aria-hidden="true">0{i + 1}</span>
+              <div className={styles.layerLabel}>{l.label}</div>
+              <h3 className={styles.layerTitle}>{l.title}</h3>
+              <p className={styles.layerDesc}>{l.desc}</p>
+            </div>
+          ))}
         </div>
       </section>
 
-      {/* ── Footer ──────────────────────────────────────────────────────────── */}
       <footer className={styles.footer}>
-        <span className={styles.footerBrand}>DisFAP</span> — Distributed Federated Access Platform
+        <strong style={{ color: '#f1f5f9' }}>DisFAP</strong> — Distributed Federated Access Platform · Secure Ephemeral Computing
       </footer>
-    </main>
+    </div>
   );
 }

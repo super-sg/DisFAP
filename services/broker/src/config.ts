@@ -19,14 +19,14 @@ export interface BrokerConfig {
 
 class ConfigError extends Error {}
 
-function req(name: string): string {
-  const v = process.env[name];
+function req(env: NodeJS.ProcessEnv, name: string): string {
+  const v = env[name];
   if (v === undefined || v === '') throw new ConfigError(`missing required env ${name}`);
   return v;
 }
 
-function int(name: string, fallback: number): number {
-  const v = process.env[name];
+function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const v = env[name];
   if (v === undefined || v === '') return fallback;
   const n = Number(v);
   if (!Number.isInteger(n)) throw new ConfigError(`env ${name} must be an integer, got ${JSON.stringify(v)}`);
@@ -43,21 +43,42 @@ export function loadConfig(env = process.env): BrokerConfig {
     if (!kid || !b64) throw new ConfigError(`malformed DFAP_SIGNING_KEYS entry ${JSON.stringify(pair)}`);
     signingKeys[kid.trim()] = b64.trim();
   }
-  const signingKid = req('DFAP_SIGNING_KID');
+  const signingKid = req(env, 'DFAP_SIGNING_KID');
   if (!signingKeys[signingKid]) throw new ConfigError(`DFAP_SIGNING_KID ${signingKid} not present in DFAP_SIGNING_KEYS`);
 
+  // The session credential is injected into guacd over this channel, so in
+  // production it must be encrypted and the gateway authenticated. The spec
+  // calls for a mutually verified channel; guacd verifies nothing but its own
+  // certificate, so the enforceable half is: TLS on, peer pinned to an
+  // operator-supplied CA. A cleartext socket is acceptable only when guacd is
+  // reached over a private, unpublished network — and that must be an explicit,
+  // named acknowledgement, never a silent default.
+  const isProduction = env['DFAP_ENV'] === 'production' || env['NODE_ENV'] === 'production';
   const tls = env['GUACD_TLS'] === 'true';
+  const allowCleartext = env['GUACD_ALLOW_CLEARTEXT'] === 'true';
+  if (isProduction && !tls && !allowCleartext) {
+    throw new ConfigError(
+      'GUACD_TLS must be true in production: the session credential is injected into guacd over this channel. ' +
+        'Set GUACD_ALLOW_CLEARTEXT=true only if guacd has no published port and is reachable solely over a private bridge.',
+    );
+  }
+  if (isProduction && tls && !env['GUACD_CA']) {
+    throw new ConfigError(
+      'GUACD_CA must be set in production so guacd is authenticated against a pinned CA, not the ambient trust store',
+    );
+  }
+
   return {
-    port: int('BROKER_PORT', 8080),
+    port: int(env, 'BROKER_PORT', 8080),
     path: env['BROKER_WS_PATH'] ?? '/tunnel',
     guacd: {
       host: env['GUACD_HOST'] ?? '127.0.0.1',
-      port: int('GUACD_PORT', 4822),
+      port: int(env, 'GUACD_PORT', 4822),
       tls,
       ...(tls
         ? {
-            certPath: req('GUACD_CERT'),
-            keyPath: req('GUACD_KEY'),
+            certPath: req(env, 'GUACD_CERT'),
+            keyPath: req(env, 'GUACD_KEY'),
             ...(env['GUACD_CA'] ? { caPath: env['GUACD_CA'] } : {}),
           }
         : {}),
@@ -65,7 +86,7 @@ export function loadConfig(env = process.env): BrokerConfig {
     signingKeys,
     signingKid,
     ...(env['REDIS_URL'] ? { redisUrl: env['REDIS_URL'] } : {}),
-    maxClientViolations: int('MAX_CLIENT_VIOLATIONS', 5),
+    maxClientViolations: int(env, 'MAX_CLIENT_VIOLATIONS', 5),
   };
 }
 

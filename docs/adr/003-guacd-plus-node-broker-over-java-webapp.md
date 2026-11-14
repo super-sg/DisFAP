@@ -25,4 +25,4 @@ The broker is built against a `ProtocolAdapter` interface from day one. Guacamol
 
 - We own the tunnel code: token redemption, filtering, reconnect, recording tee.
 - Option C (sidecar guacd per VM) remains available later as a premium "no shared infrastructure" tier — the adapter seam makes it a deployment change, not a rewrite. It is not MVP because session recording must be written on trusted infrastructure, not the ephemeral VM.
-- guacd runs in a private subnet, mTLS on 4822, reachable only from the broker's security group — guacd itself has no authentication.
+- guacd runs in a private subnet, reachable only from the broker's security group — guacd itself has no authentication. The hop is TLS with a certificate pinned by `GUACD_CA` (required in production), so the peer is authenticated and the credential is encrypted in transit; guacd requests no client certificate, so it is **not** mutual TLS, and the channel is cleartext only where an operator explicitly acknowledges a private, unpublished network (`GUACD_ALLOW_CLEARTEXT`).

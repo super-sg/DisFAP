@@ -1,0 +1,110 @@
+.topBar {
+  height: 52px;
+  background: #0a0e17;
+  border-bottom: 1px solid #1a2332;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1.5rem;
+  position: sticky;
+  top: 0;
+  z-index: 90;
+}
+
+.leftSection {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+}
+
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  color: #64748b;
+}
+
+.breadcrumbSegment {
+  color: #94a3b8;
+  font-weight: 500;
+}
+
+.breadcrumbActive {
+  color: #f1f5f9;
+  font-weight: 600;
+}
+
+.quickNav {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.quickBtn {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  padding: 0.3125rem 0.625rem;
+  border-radius: 5px;
+  color: #94a3b8;
+  background: transparent;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.quickBtn:hover {
+  background: #111726;
+  color: #f8fafc;
+}
+
+.quickBtnActive {
+  background: #172033;
+  color: #38bdf8;
+  border-color: #243044;
+}
+
+.rightSection {
+  display: flex;
+  align-items: center;
+  gap: 0.875rem;
+}
+
+.statusBadge {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', monospace;
+  color: #34d399;
+  background: rgba(16, 185, 129, 0.08);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  padding: 0.1875rem 0.5rem;
+  border-radius: 4px;
+}
+
+.statusDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: #10b981;
+}
+
+.roleTag {
+  font-size: 0.75rem;
+  padding: 0.1875rem 0.5rem;
+  background: #111726;
+  border: 1px solid #1e293b;
+  border-radius: 4px;
+  color: #94a3b8;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.roleTag:hover {
+  border-color: #38bdf8;
+  color: #f1f5f9;
+}
+

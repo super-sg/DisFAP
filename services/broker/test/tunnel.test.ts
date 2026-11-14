@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { Tunnel, type ClientSocket, type SecurityEvent, type TunnelDeps } from '../src/tunnel.js';
 import { InMemoryNonceStore } from '../src/nonce-store.js';
 import { InMemorySessionResolver } from '../src/session-resolver.js';
@@ -62,7 +62,9 @@ class FakeAdapter implements ProtocolAdapter {
   async connect(target: SessionTarget, credential: SessionCredential): Promise<ProtocolConnection> {
     if (this.failConnect) throw new Error('guacd down');
     this.lastTarget = target;
-    this.lastCredential = credential;
+    // Snapshot: the tunnel wipes the provider's credential object in place once
+    // connect() returns, so keep what was actually delivered at handshake time.
+    this.lastCredential = { ...credential };
     return this.upstream;
   }
 }
@@ -130,6 +132,26 @@ describe('Tunnel — auth and connect', () => {
     // The credential must never have been sent toward the client.
     expect(h.client.sentWire).not.toContain('S3cr3t');
     expect(h.client.sentWire).not.toContain('session-user');
+  });
+
+  it('erases the credential in place once it has been injected', async () => {
+    // The provider's object is the last retained plaintext copy in the process;
+    // the tunnel must overwrite it as soon as connect() returns.
+    const handed: SessionCredential = { username: 'session-user', password: 'S3cr3t' };
+    const h = harness({ credentials: { fetch: async () => handed } });
+    h.client.deliver(h.validToken());
+    await tick();
+    expect(h.adapter.lastCredential).toEqual({ username: 'session-user', password: 'S3cr3t' });
+    expect(handed).toEqual({ username: '', password: '' });
+  });
+
+  it('erases the credential even when the handshake fails', async () => {
+    const handed: SessionCredential = { username: 'session-user', password: 'S3cr3t' };
+    const h = harness({ credentials: { fetch: async () => handed } });
+    h.adapter.failConnect = true;
+    h.client.deliver(h.validToken());
+    await tick();
+    expect(handed).toEqual({ username: '', password: '' });
   });
 
   it('rejects and does not connect on a bad signature', async () => {
@@ -261,5 +283,141 @@ describe('Tunnel — streaming and filtering', () => {
     h.adapter.upstream.close();
     await tick();
     expect(h.client.closed).not.toBeNull();
+  });
+});
+
+describe('Tunnel — nonce store failure', () => {
+  it('fails closed when the replay store is unavailable (no connect, no crash)', async () => {
+    const h = harness({
+      nonces: {
+        burn: async () => {
+          throw new Error('redis: connect failed');
+        },
+      },
+    });
+    h.client.deliver(h.validToken());
+    await tick();
+    // No credential was fetched, no upstream connection was opened.
+    expect(h.adapter.lastTarget).toBeNull();
+    expect(h.client.closed?.code).toBe(4003);
+    expect(h.events.some((e) => e.kind === 'auth_failure' && e.detail.includes('nonce store'))).toBe(true);
+  });
+});
+
+describe('Tunnel — disconnect lifecycle', () => {
+  async function connected(): Promise<Harness> {
+    const h = harness();
+    h.client.deliver(h.validToken());
+    await tick();
+    h.resolver.disconnected.length = 0;
+    h.resolver.terminated.length = 0;
+    return h;
+  }
+
+  it('marks a streaming session disconnected on a client drop (recoverable)', async () => {
+    const h = await connected();
+    h.client.close(1000, 'tab closed');
+    await tick();
+
+    expect(h.resolver.disconnected).toEqual([{ sid: 'ses_1', reason: 'client closed' }]);
+    expect(h.resolver.terminated).toEqual([]);
+    expect(h.adapter.upstream.closed).toBe(true);
+  });
+
+  it('marks disconnected when guacd drops the upstream (VM survives)', async () => {
+    const h = await connected();
+    h.adapter.upstream.close();
+    await tick();
+
+    expect(h.resolver.disconnected).toHaveLength(1);
+    expect(h.resolver.disconnected[0]!.sid).toBe('ses_1');
+    expect(h.resolver.terminated).toEqual([]);
+  });
+
+  it('does not start a grace window after a failed handshake', async () => {
+    const h = harness();
+    h.adapter.failConnect = true;
+    h.client.deliver(h.validToken());
+    await tick();
+
+    expect(h.client.closed?.code).toBe(4000);
+    expect(h.resolver.disconnected).toEqual([]);
+    expect(h.resolver.terminated).toEqual([]);
+  });
+
+  it('does not grant grace on a replayed capability (fatal security event)', async () => {
+    const h = await connected();
+    const replayToken = mintConnectToken(
+      { sid: 'ses_1', sub: 'usr_1', org: 'org_1', jti: 'jti-replay-forced' },
+      h.keyring,
+    );
+    // Burn the id out-of-band, then present a validly-signed capability for it.
+    await h.nonces.burn('dfap:jti:jti-replay-forced', 120);
+    const client2 = new FakeClient();
+    new Tunnel(client2, {
+      adapter: new FakeAdapter(),
+      keyring: h.keyring,
+      nonces: h.nonces,
+      resolver: h.resolver,
+      credentials: h.creds,
+      onSecurityEvent: () => undefined,
+    });
+    client2.deliver(replayToken);
+    await tick();
+
+    expect(client2.closed?.code).toBe(4003);
+    expect(h.resolver.terminated).toHaveLength(1);
+    expect(h.resolver.terminated[0]!.reason).toBe('connect-token replay');
+    expect(h.resolver.disconnected).toEqual([]);
+  });
+
+  it('does not grant grace on a malformed client stream (fatal protocol error)', async () => {
+    const h = await connected();
+    h.client.deliver('bogus-not-guac|');
+    await tick();
+
+    expect(h.client.closed?.code).toBe(4002);
+    expect(h.resolver.terminated).toHaveLength(1);
+    expect(h.resolver.terminated[0]!.reason).toBe('client stream parse error');
+    expect(h.resolver.disconnected).toEqual([]);
+  });
+
+  it('refuses to stream when the reaper won the connection race', async () => {
+    const base = new InMemorySessionResolver();
+    base.put('ses_1', {
+      target,
+      credentialWrapToken: 'wrap-abc',
+      state: 'disconnected',
+      org: 'org_1',
+      sub: 'usr_1',
+    });
+    const terminate = vi.fn(async () => undefined);
+    const markDisconnected = vi.fn(async () => undefined);
+    const h = harness({
+      resolver: {
+        resolve: (sid, jti) => base.resolve(sid, jti),
+        markConnected: async () => false, // someone claimed `expired` first
+        markDisconnected,
+        terminate,
+      },
+    });
+    h.client.deliver(h.validToken());
+    await tick();
+
+    expect(h.client.closed?.code).toBe(4003);
+    expect(h.adapter.upstream.closed).toBe(true);
+    // Losing the claim is not itself a security event, but no grace is started
+    // and nothing is revived.
+    expect(markDisconnected).not.toHaveBeenCalled();
+    expect(terminate).not.toHaveBeenCalled();
+  });
+
+  it('passes the capability jti to the resolver (handle binding)', async () => {
+    const h = harness();
+    const token = mintConnectToken({ sid: 'ses_1', sub: 'usr_1', org: 'org_1', jti: 'jti-explicit' }, h.keyring);
+    h.client.deliver(token);
+    await tick();
+
+    expect(h.resolver.resolvedJti.get('ses_1')).toBe('jti-explicit');
   });
 });

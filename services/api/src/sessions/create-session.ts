@@ -9,7 +9,7 @@
  * ONLY: no host, no port, no credential (ADR-002).
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mintConnectToken } from '@disfap/broker/src/session-token.js';
 import type { Keyring } from '@disfap/broker/src/session-token.js';
 
@@ -112,6 +112,16 @@ export interface CreateSessionInput {
    * the layer-3 orchestrator (never by an HTTP handler from request data).
    */
   templateGrant?: TemplateGrant;
+  /**
+   * Evaluation-only declaration that `credential` is a DEDICATED, throwaway
+   * demo credential — never a person's reusable password. The evaluation
+   * `CloudInitInjector` refuses to write ANY credential to EC2 userData unless
+   * this is true, so a reusable licensed credential can never be silently
+   * placed in userData (fail closed). Set by the layer-3 orchestrator from the
+   * listing's own explicit `demoOnly` marker; the generated base-workspace
+   * credential is demo-only by construction.
+   */
+  demoOnly?: boolean;
 }
 
 export interface CreateSessionResult {
@@ -176,18 +186,17 @@ export async function createSession(
   try {
     // 4. requested -> allocating, then claim/launch the VM.
     await deps.sessions.update(sid, { state: transition('requested', 'allocate') });
-    claim = await deps.pool.claim(template.id, sid, input.credential);
+    const credential = input.credential ?? generateSessionCredential(template.os === 'windows' ? 'dfap-admin' : 'dfap-user');
+    // A generated base-workspace credential is demo-only by construction. A
+    // marketplace credential reaches the VM's userData ONLY when the listing
+    // explicitly declared it a dedicated demo credential (`input.demoOnly`);
+    // otherwise the evaluation injector refuses it (fail closed).
+    const demoOnly = input.credential === undefined || input.demoOnly === true;
+    claim = await deps.pool.claim(template.id, sid, { ...credential, demoOnly });
 
     // 5. Stage the per-session credential in Vault; keep the single-use wrap
     //    token in-process (never in Postgres). Persist only the Vault path.
-    const credential = input.credential ?? generateSessionCredential(template.os === 'windows' ? 'dfap-admin' : 'dfap-user');
     const issued = await deps.credentialIssuer.issue(sid, credential, deps.config.credentialTtlS);
-    // Cache the wrap token for the credential's whole TTL. A real cold start
-    // (image install + RDP bring-up) can take minutes, and readiness is only
-    // reported once the VM is genuinely up (see pool/readiness.ts); the DFAP1
-    // handle is re-minted on every getSession poll, so only this in-process
-    // wrap token must outlive the wait.
-    deps.wrapCache.put(sid, issued.wrapToken, deps.config.credentialTtlS);
 
     await deps.audit.record({
       orgId: principal.orgId,
@@ -203,6 +212,10 @@ export async function createSession(
     //    identity only.
     const nowS = Math.floor(now().getTime() / 1000);
     const cbh = channelBinding(input.clientIp, input.clientUa);
+    // Bind the Vault wrap token to this capability's jti. The broker redeems
+    // with the jti from the verified token, so a handle staged for a different
+    // connection can never be consumed by this one.
+    const jti = randomBytes(16).toString('hex');
     const token = mintConnectToken(
       {
         sid,
@@ -210,10 +223,14 @@ export async function createSession(
         org: principal.orgId,
         ttlSeconds: deps.config.connectTokenTtlS,
         now: nowS,
+        jti,
         ...(cbh !== undefined ? { cbh } : {}),
       },
       deps.keyring,
     );
+    // The wrap only needs to outlive the capability; a client that misses this
+    // window asks `GET /sessions/:id` for a fresh one (see connect-handle.ts).
+    deps.wrapCache.put(sid, jti, issued.wrapToken, Math.min(deps.config.credentialTtlS, deps.config.connectTokenTtlS + 60));
     const expiresAt = new Date((nowS + deps.config.connectTokenTtlS) * 1000).toISOString();
 
     // 6. When readiness is NOT deferred (tests / warm-pool / trusted path) the

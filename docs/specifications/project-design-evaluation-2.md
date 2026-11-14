@@ -230,13 +230,13 @@ Every architectural design construct is strictly synchronized with implemented f
 
 | Functional Requirement | Architectural Module | Design Pattern Used | Source Code Implementation Reference |
 |---|---|---|---|
-| **FR-1: License Listing & Storing** | `services/api/src/marketplace/` | Hexagonal Port / Repository Pattern | [`PrismaMarketplaceStore`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/marketplace/prisma-marketplace-store.ts), [`schema.prisma`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/prisma/schema.prisma) |
-| **FR-2: Dynamic Pair-Key Cryptography** | `services/api/src/crypto/` | Key Derivation Function (HKDF) | [`pair-keys.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/crypto/pair-keys.ts), [`hsm-rsa.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/crypto/hsm-rsa.ts) |
-| **FR-3: Parallel Two-Thread Launch** | `services/api/src/orchestrator/` | Fork-Join Concurrency Pattern | [`two-thread-orchestrator.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/orchestrator/two-thread-orchestrator.ts) |
-| **FR-4: Zero-Exposure Pre-Boot Injection** | `services/api/src/cloud/` | Cloud-Init Builder Pattern | [`cloud-init-injector.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/cloud/cloud-init-injector.ts), [`aws-cloud-provider.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/cloud/aws-cloud-provider.ts) |
-| **FR-5: Opaque Connection Brokering** | `services/broker/src/` | Token Redemption / Proxy Pattern | [`session-resolver.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/broker/src/session-resolver.ts), [`index.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/broker/src/index.ts) |
-| **FR-6: Bidirectional Stream Sanitization** | `services/broker/src/` | Stream Filter / Pipeline Pattern | [`instruction-filter.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/broker/src/instruction-filter.ts) |
-| **FR-7: Ephemeral 5-Layer Teardown** | `services/api/src/reaper/` | Dead-Man Switch & Active Sweeper | [`reaper.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/reaper/reaper.ts), [`readiness-reconciler.ts`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/orchestrator/readiness-reconciler.ts) |
+| **FR-1: License Listing & Storing** | `services/api/src/marketplace/` | Hexagonal Port / Repository Pattern | [`PrismaMarketplaceStore`](../../services/api/src/marketplace/prisma-license-store.ts), [`schema.prisma`](../../services/api/prisma/schema.prisma) |
+| **FR-2: Dynamic Pair-Key Cryptography** | `services/api/src/crypto/` | Key Derivation Function (HKDF) | [`pair-keys.ts`](../../services/api/src/crypto/pair-keys.ts), [`hsm-rsa.ts`](../../services/api/src/crypto/hsm-rsa.ts) |
+| **FR-3: Parallel Two-Thread Launch** | `services/api/src/orchestrator/` | Fork-Join Concurrency Pattern | [`two-thread-orchestrator.ts`](../../services/api/src/orchestrator/two-thread-orchestrator.ts) |
+| **FR-4: Zero-Exposure Pre-Boot Injection** | `services/api/src/cloud/` | Cloud-Init Builder Pattern | [`cloud-init-injector.ts`](../../services/api/src/cloud/cloud-init-injector.ts), [`provider.ts`](../../services/api/src/cloud/provider.ts) |
+| **FR-5: Opaque Connection Brokering** | `services/broker/src/` | Token Redemption / Proxy Pattern | [`session-resolver.ts`](../../services/broker/src/session-resolver.ts), [`session-token.ts`](../../services/broker/src/session-token.ts) |
+| **FR-6: Bidirectional Stream Sanitization** | `services/broker/src/` | Stream Filter / Pipeline Pattern | [`instruction-filter.ts`](../../services/broker/src/instruction-filter.ts) |
+| **FR-7: Ephemeral 5-Layer Teardown** | `services/api/src/pool/` | Dead-Man Switch & Active Sweeper | [`reaper.ts`](../../services/api/src/pool/reaper.ts), [`readiness.ts`](../../services/api/src/pool/readiness.ts) |
 
 ### 5.2 Dynamic Session Lifecycle Synchronization
 

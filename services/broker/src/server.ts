@@ -1,26 +1,28 @@
 /**
- * Broker entrypoint: a WebSocket server that hands each connection to a
+ * Broker server factory: a WebSocket server that hands each connection to a
  * Tunnel. Also serves a plain `/healthz` for load-balancer checks.
  *
  * This file is deliberately thin — all behavior lives in Tunnel and its
- * injected dependencies, which are unit-tested without a socket. Here we only
- * wire real implementations (guacd adapter, Redis nonce store, HTTP session
- * resolver, Vault credential provider) to the tunnel.
+ * injected dependencies, which are unit-tested without a socket. `createBroker`
+ * receives the guacd adapter plus a session resolver and credential provider
+ * supplied by the host process:
  *
- * Phase-0 note: the session resolver and credential provider point at the
- * co-located control plane. Production swaps in the Vault-backed and
- * database-backed implementations without touching the tunnel.
+ *  - in the supported topology the control plane hosts this in-process
+ *    (`services/api/src/server.ts`) and injects its Prisma resolver + Vault
+ *    provider;
+ *  - a standalone launch is REFUSED (see the bottom of this file) because a
+ *    broker with no resolver/identity answers /healthz and rejects every tunnel.
  */
 
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
-import { keyringFromConfig, loadConfig, readGuacdTls, type BrokerConfig } from './config.js';
+import { keyringFromConfig, readGuacdTls, type BrokerConfig } from './config.js';
 import { GuacdAdapter } from './protocol/guacd-adapter.js';
 import { Tunnel, type SecurityEvent, type TunnelDeps } from './tunnel.js';
 import { wrapWebSocket } from './ws-adapter.js';
 import { InMemoryNonceStore, type NonceStore } from './nonce-store.js';
-import { InMemorySessionResolver, type SessionResolver } from './session-resolver.js';
-import { StaticCredentialProvider, type CredentialProvider } from './vault/credential-provider.js';
+import type { SessionResolver } from './session-resolver.js';
+import type { CredentialProvider } from './vault/credential-provider.js';
 
 export interface ServerDeps {
   resolver: SessionResolver;
@@ -84,27 +86,21 @@ export function createBroker(cfg: BrokerConfig, deps: ServerDeps): { start: () =
 
 // Direct-run entrypoint (node dist/server.js).
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const cfg = loadConfig();
-  const resolver = new InMemorySessionResolver();
-  const credentials = new StaticCredentialProvider();
-  const broker = createBroker(cfg, { resolver, credentials });
-  broker
-    .start()
-    .then((port) => {
-      // eslint-disable-next-line no-console
-      console.log(`[broker] DisFAP broker listening on port ${port} (standalone mode)`);
-    })
-    .catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error('[broker] fatal: broker failed to start', err);
-      process.exit(1);
-    });
-
-  const shutdown = async (): Promise<void> => {
-    await broker.stop();
-    process.exit(0);
-  };
-  process.on('SIGTERM', () => void shutdown());
-  process.on('SIGINT', () => void shutdown());
+  // The broker is NOT self-sufficient: resolving a session id and fetching its
+  // credential both require the control plane's database and Vault identity.
+  // This entrypoint previously wired empty in-memory stubs, which produced a
+  // process that answered /healthz with 200 while rejecting every tunnel with
+  // 4003 — an outage disguised as a healthy service. Fail closed instead of
+  // pretending to serve.
+  // eslint-disable-next-line no-console
+  console.error(
+    '[broker] refusing to start standalone: no session resolver or credential provider is configured.\n' +
+      '  Supported topology: the control plane hosts the broker in-process\n' +
+      '  (services/api/src/server.ts — createBroker with PrismaSessionResolver +\n' +
+      '  VaultCredentialProvider). A split deployment must first supply this\n' +
+      '  process with an authenticated resolver and its own least-privilege Vault\n' +
+      '  identity; see docs/security/architecture.md ("Broker trust boundary").',
+  );
+  process.exit(1);
 }
 

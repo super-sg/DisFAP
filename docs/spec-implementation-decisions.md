@@ -665,7 +665,7 @@ when you want to validate the **real** paths:
 | Real path | Adapter to configure | Credential/secret needed |
 |---|---|---|
 | Real VM launch/terminate | `AwsCloudProvider` (`CLOUD_PROVIDER=aws`) | AWS creds + `AWS_LAUNCH_TEMPLATE_ID`, `AWS_REGION` |
-| Real Vault (wrap tokens) | `HttpVaultClient` | `VAULT_ADDR`, `VAULT_TOKEN` (unsealed cluster) |
+| Real Vault (wrap tokens) | `HttpVaultClient` | `VAULT_ADDR` + **AppRole** `VAULT_APPROLE_ROLE_ID`/`SECRET_ID(_FILE)` (preferred; `VAULT_TOKEN(_FILE)` is the scoped static fallback), unsealed cluster |
 | Hardware-backed key | not implemented — swap the software provider for Vault Transit / CloudHSM | HSM/KMS endpoint + creds; keep `DFAP_CREDENTIAL_KEY_FILE`/`_PEM` for the software path |
 | Real Stripe | `RealStripeClient` | `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET` |
 | Golden image w/ preboot unit | `infra/packer` + `infra/terraform` | AWS creds + `session_ami_id` |
@@ -674,10 +674,12 @@ when you want to validate the **real** paths:
 **Production hardening that must happen before a paying tenant:** set
 `DFAP_PAIR_MASTER_KEY` (base64, ≥32 bytes, secret-managed), configure a durable
 credential key via `DFAP_CREDENTIAL_KEY_FILE` or `DFAP_CREDENTIAL_KEY_PEM`, and
-point `VAULT_ADDR`/`VAULT_TOKEN` at a real cluster — config now refuses to boot in
-production without all three (see
-[runbooks/key-management.md](runbooks/key-management.md)). Then apply the Prisma
-migrations (`npx prisma migrate dev` locally, `migrate deploy` in deploy).
+point `VAULT_ADDR` at a real cluster and give the API a scoped AppRole
+(`make vault-bootstrap`, then `VAULT_APPROLE_ROLE_ID`/`VAULT_APPROLE_SECRET_ID`) —
+config refuses to boot in production without all three (see
+[runbooks/key-management.md](runbooks/key-management.md) and
+[security/secrets-management.md](security/secrets-management.md)). Then apply the
+Prisma migrations (`npx prisma migrate dev` locally, `migrate deploy` in deploy).
 
 Step-by-step instructions for actually running the AWS paths (tooling, IAM,
 Terraform, AMI build, verification, teardown) live in

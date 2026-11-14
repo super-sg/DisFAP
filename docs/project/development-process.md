@@ -224,9 +224,9 @@ DFAP_TEST_DATABASE_URL="postgresql://user:pass@localhost:5432/dfap_test" \
 
 ## 6. Project Artifacts & File Deliverable Mapping
 
-* **Full Project Design Specification:** [`PROJECT_DESIGN_SPECIFICATION_EVAL2.md`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/PROJECT_DESIGN_SPECIFICATION_EVAL2.md)
-* **AWS Demo Plan & Resource Strategy:** [`aws_demo_plan.md`](file:///Users/supersg/.gemini/antigravity-ide/brain/253032fc-47ef-4d84-beca-50f062c50eed/aws_demo_plan.md)
-* **Control Plane API Core:** [`services/api/src/`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/src/)
-* **Session Broker & Instruction Filter:** [`services/broker/src/`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/broker/src/)
-* **Web Client & Canvas Streaming:** [`apps/web/src/`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/apps/web/src/)
-* **Database Schema & Migrations:** [`services/api/prisma/`](file:///Users/supersg/Documents/Random%20Projects/DisFAP/services/api/prisma/)
+* **Full Project Design Specification:** [project-design-evaluation-2.md](../specifications/project-design-evaluation-2.md)
+* **AWS Demo Plan & Resource Strategy:** [demo-evaluation.md](../runbooks/demo-evaluation.md)
+* **Control Plane API Core:** [services/api/src/](../../services/api/src/)
+* **Session Broker & Instruction Filter:** [services/broker/src/](../../services/broker/src/)
+* **Web Client & Canvas Streaming:** [apps/web/src/](../../apps/web/src/)
+* **Database Schema & Migrations:** [services/api/prisma/](../../services/api/prisma/)

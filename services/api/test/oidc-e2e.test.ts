@@ -55,6 +55,7 @@ const crossTenantSession: SessionRecord = {
   firstPixelAt: null,
   connectedAt: null,
   disconnectedAt: null,
+  disconnectDeadlineAt: null,
   endedAt: null,
   endReason: null,
   billableSeconds: null,

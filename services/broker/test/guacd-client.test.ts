@@ -47,6 +47,27 @@ describe('buildProtocolParams / buildConnectValues', () => {
     ]);
   });
 
+  it('echoes the protocol-version element guacd lists first in args', () => {
+    const params = buildProtocolParams(target, credential);
+    // guacd >= 1.5.0 lists VERSION as the first element of `args`; `connect`
+    // must return a value for it too, or every parameter shifts by one.
+    const argNames = ['VERSION_1_5_0', 'hostname', 'port', 'username', 'password'];
+    expect(buildConnectValues(argNames, params)).toEqual([
+      'VERSION_1_5_0',
+      '10.0.1.5',
+      '3389',
+      'session-user',
+      'S3cr3t-P@ss',
+    ]);
+  });
+
+  it('treats a non-version first element as an ordinary parameter', () => {
+    const params = buildProtocolParams(target, credential);
+    // Older guacd (pre-1.5.0) sends no version element; the first element is
+    // then a real parameter name and must be resolved normally.
+    expect(buildConnectValues(['hostname', 'port'], params)).toEqual(['10.0.1.5', '3389']);
+  });
+
   it('adds recording params only when recording is configured', () => {
     expect(buildProtocolParams(target, credential)['recording-path']).toBeUndefined();
     const rec = buildProtocolParams(
@@ -142,8 +163,17 @@ describe('GuacdClient handshake', () => {
     await mock.listen();
     const client = new GuacdClient({ endpoint: { host: '127.0.0.1', port: mock.port, tls: false } });
     const conn = await client.open(target, credential);
-    // args were [hostname, port, username, password, disable-copy]
-    expect(mock.lastConnect).toEqual(['10.0.1.5', '3389', 'session-user', 'S3cr3t-P@ss', 'true']);
+    // args were [VERSION_1_5_0, hostname, port, username, password, disable-copy].
+    // The version element is echoed back first — guacd requires one value per
+    // element it sent, so dropping it shifts every parameter by one.
+    expect(mock.lastConnect).toEqual([
+      'VERSION_1_5_0',
+      '10.0.1.5',
+      '3389',
+      'session-user',
+      'S3cr3t-P@ss',
+      'true',
+    ]);
     conn.close('done');
   });
 

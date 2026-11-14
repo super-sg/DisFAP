@@ -1,7 +1,7 @@
 /**
  * PrismaClient singleton. Kept in one module so the generated client is
  * imported in exactly one place; the rest of the codebase depends on the port
- * interfaces in `src/ports.ts` and the adapters in `prisma-repos.ts`.
+ * interfaces in `src/ports.ts` and the adapters in `db/repos/`.
  *
  * NOTE: `@prisma/client` must be generated (`npm run prisma:generate`) before
  * type-checking or running this file.

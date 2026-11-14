@@ -1,7 +1,11 @@
-# Prisma migrations
+# DisFAP control-plane database
 
-Prisma migration history for the control-plane database. Apply with
-`npx prisma migrate deploy`; generate a new one with `npx prisma migrate dev`.
+PostgreSQL schema managed with Prisma. The canonical model is
+[`schema.prisma`](../schema.prisma); the migration directories below are the
+immutable, ordered change history used to bring a database to that model.
+Apply reviewed migrations with `npx prisma migrate deploy`. Create a migration
+for a schema change with `npx prisma migrate dev --name <description>` against a
+disposable development database, then review the generated SQL before merging.
 
 ## History
 
@@ -9,6 +13,8 @@ Prisma migration history for the control-plane database. Apply with
 |---|---|
 | `20261016000000_init` | The initial baseline, generated from an **empty** datamodel (`prisma migrate diff --from-empty --to-schema-datamodel`). Creates every table, enum, index and FK in `schema.prisma`, including `sessions.license_id` and `sessions_license_id_state_idx`. |
 | `20261016010000_external_identities` | Adds `external_identities` — the `(issuer, subject) → user_id` map for OIDC identities, with a `UNIQUE (issuer, subject)` index and an FK to `users`. Authored with `prisma migrate diff --from-url <baseline> --to-schema-datamodel`. |
+| `20261111000000_session_disconnect_lifecycle` | Adds the persisted reconnect deadline, indexes for lifecycle reaper scans, and a unique usage-record-per-session constraint. It fails if historical usage contains duplicate session rows; resolve those explicitly before applying. |
+| `20261112000000_license_access_duration` | Adds the nullable per-listing maximum rental duration. Existing listings remain governed by the API's global cap. |
 
 ## Fresh database
 
@@ -52,5 +58,10 @@ to lose.
 
 - Do not apply this migration to an existing, important, or production database.
 - Do not reset or `db push --force` an existing database.
+- Back up the target database and apply migrations through the deployment
+  runbook during a reviewed release window.
+- Treat migrations already applied to any shared database as immutable. Fix a
+  mistake with a new forward migration; never delete or rewrite migration
+  history to make the directory look cleaner.
 - To validate locally, use a disposable cluster (see the commands in
   `HANDOFF.md` §10.2), never the developer's working database.

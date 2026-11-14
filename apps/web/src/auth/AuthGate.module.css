@@ -1,70 +1,89 @@
 .page {
-  min-height: 60vh;
+  min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 3rem 1rem;
+  background: radial-gradient(circle at 50% 20%, #111726 0%, #06090e 100%);
+  padding: 1.5rem;
+  color: #f8fafc;
 }
 
 .card {
   width: 100%;
-  max-width: 26rem;
-  text-align: center;
-  padding: 2.5rem 2rem;
-  border-radius: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(18, 20, 28, 0.92);
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+  max-width: 440px;
+  background: #0d121d;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  padding: 2.25rem;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
 }
 
-.mark {
-  width: 3rem;
-  height: 3rem;
-  margin: 0 auto 1.25rem;
-  border-radius: 12px;
-  display: grid;
-  place-items: center;
+.brandRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.brandText {
+  font-size: 1.25rem;
   font-weight: 700;
-  font-size: 1.5rem;
-  color: #0b0d12;
-  background: linear-gradient(135deg, #7c9cff, #4f6ef7);
+  color: #f8fafc;
+  letter-spacing: -0.02em;
+}
+
+.brandAccent {
+  color: #0284c7;
 }
 
 .title {
-  margin: 0 0 0.5rem;
-  font-size: 1.4rem;
-  color: #f2f4f8;
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: #f1f5f9;
+  margin: 0;
 }
 
 .subtitle {
-  margin: 0 0 1.5rem;
-  color: rgba(242, 244, 248, 0.62);
-  font-size: 0.95rem;
+  font-size: 0.84375rem;
+  color: #94a3b8;
+  line-height: 1.5;
+  margin: 0;
 }
 
 .error {
-  margin: 0 0 1.25rem;
-  padding: 0.75rem 0.9rem;
-  border-radius: 10px;
-  font-size: 0.9rem;
-  color: #ffd7d7;
-  background: rgba(220, 60, 60, 0.16);
-  border: 1px solid rgba(220, 60, 60, 0.4);
+  padding: 0.75rem 1rem;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  border-radius: 6px;
+  color: #f87171;
+  font-size: 0.8125rem;
 }
 
 .button {
-  width: 100%;
-  padding: 0.8rem 1rem;
-  border: none;
-  border-radius: 10px;
-  font-size: 1rem;
+  height: 38px;
+  padding: 0 1.25rem;
+  background: #0284c7;
+  color: #ffffff;
+  border: 1px solid #0369a1;
+  border-radius: 6px;
   font-weight: 600;
-  color: #0b0d12;
-  background: linear-gradient(135deg, #7c9cff, #4f6ef7);
+  font-size: 0.875rem;
   cursor: pointer;
+  transition: all 140ms ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.button:hover:not(:disabled) {
+  background: #0ea5e9;
+  border-color: #0284c7;
 }
 
 .button:disabled {
-  opacity: 0.6;
-  cursor: default;
+  opacity: 0.5;
+  cursor: not-allowed;
 }

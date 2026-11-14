@@ -17,6 +17,8 @@ function cfg(devFallback: boolean): ApiConfig {
     brokerUrl: 'ws://localhost:8080/tunnel',
     connectTokenTtlS: 60,
     credentialTtlS: 900,
+    sessionDisconnectGraceS: 30,
+    sessionReaperIntervalS: 15,
     cloud: 'fake',
     devFallback,
     authMode: 'deny',
@@ -24,6 +26,8 @@ function cfg(devFallback: boolean): ApiConfig {
     guestProvisioning: 'disabled',
     guestProvisioningTtlS: 900,
     guestProvisioningMaxDeliveries: 10,
+    readyTimeoutS: 600,
+    readyProbePort: 3389,
   };
 }
 

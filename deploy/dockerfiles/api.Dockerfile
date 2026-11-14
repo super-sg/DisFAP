@@ -54,6 +54,9 @@ WORKDIR /repo/services/api
 USER node
 
 EXPOSE 3000
+# The in-process broker's WebSocket listener (BROKER_PORT). EXPOSE is
+# documentation only — compose publishes nothing; Caddy reaches api:8080.
+EXPOSE 8080
 
 # The api is expected to expose /healthz (used by compose + Caddy upstream).
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \

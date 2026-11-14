@@ -84,6 +84,12 @@ export interface MintInput {
   typ?: TokenHeader['typ'];
   ttlSeconds?: number;
   now?: number; // epoch seconds, injectable for tests
+  /**
+   * Caller-supplied connection id. The control plane mints a capability and
+   * stages the Vault wrap token under this same id, so the broker can only
+   * redeem the handle issued for THIS capability. Generated when omitted.
+   */
+  jti?: string;
 }
 
 export function mintConnectToken(input: MintInput, keyring: Keyring): string {
@@ -98,7 +104,7 @@ export function mintConnectToken(input: MintInput, keyring: Keyring): string {
     aud: 'broker',
     iat: now,
     exp: now + (input.ttlSeconds ?? CONNECT_TOKEN_TTL_S),
-    jti: randomBytes(16).toString('hex'),
+    jti: input.jti ?? randomBytes(16).toString('hex'),
     ...(input.cbh !== undefined ? { cbh: input.cbh } : {}),
     scp: ['connect'],
   };

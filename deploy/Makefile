@@ -7,6 +7,7 @@
 #   make gen-keys   # print a fresh DFAP1 signing keyring to paste into .env
 #   make up         # build + start the whole stack (detached)
 #   make migrate    # prisma migrate deploy inside a throwaway api container
+#   make vault-bootstrap  # one-time: policies + AppRole (prompts for root token)
 #   make logs       # tail all service logs
 #   make down       # stop the stack (volumes kept)
 # =============================================================================
@@ -53,8 +54,11 @@ psql: ## Open a psql shell on the Postgres container
 vault-status: ## Show Vault seal/init status (sealed until you unseal it)
 	$(COMPOSE) exec vault vault status || true
 
+vault-bootstrap: ## One-time: create least-privilege policies + AppRole (prompts for the root token)
+	$(COMPOSE) exec vault sh /vault/bootstrap/bootstrap.sh
+
 restart: ## Recreate app containers without a full rebuild
-	$(COMPOSE) up -d --no-build api broker web caddy
+	$(COMPOSE) up -d --no-build api web caddy
 
 # Swallow extra goal words (e.g. the `web` in `make build web`) so they don't
 # error as unknown targets.

@@ -16,7 +16,7 @@
  *  - the issuer is matched exactly (an absolute http(s) URL, unmodified).
  *
  * The pure logic lives here so it is unit-testable; the Prisma adapter lives in
- * `db/prisma-repos.ts` and the CLI in `cli/provision-identity.ts`.
+ * `db/repos/identity.ts` and the CLI in `cli/provision-identity.ts`.
  */
 
 export interface IdentityProvisioningStore {

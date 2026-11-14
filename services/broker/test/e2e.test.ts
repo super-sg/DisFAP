@@ -163,7 +163,16 @@ describe('broker end-to-end (real WebSocket + real guacd handshake)', () => {
     await waitForEvent('connected'); // broker finished the handshake + markConnected
 
     // The credential reached guacd server-side, positionally in connect values.
-    expect(guacd.connectValues).toEqual(['10.0.9.9', '3389', 'vm-user', 'Tr0ub4dour&3', 'true']);
+    // The leading element is the echoed protocol version (guacd 1.5.0+ lists it
+    // first in `args`, and connect must return one value per element).
+    expect(guacd.connectValues).toEqual([
+      'VERSION_1_5_0',
+      '10.0.9.9',
+      '3389',
+      'vm-user',
+      'Tr0ub4dour&3',
+      'true',
+    ]);
 
     // Drive a frame from guacd and confirm it reaches the browser.
     const gotFrame = nextMsg(ws);

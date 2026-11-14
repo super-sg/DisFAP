@@ -1,11 +1,12 @@
 # DisFAP Architecture
 
 For the security guarantees and threat model, see [security.md](security.md). For why the load-bearing decisions were made, see [adr/](adr/).
+The source flow diagram is available at [architecture/assets/disfap-flow.png](architecture/assets/disfap-flow.png).
 
 ## Component map
 
 ```
-┌──────────┐   wss:// (token in first frame)   ┌──────────────┐  TCP 4822 mTLS  ┌───────┐  RDP 3389  ┌────────────┐
+┌──────────┐   wss:// (token in first frame)   ┌──────────────┐  TLS 4822 (CA)  ┌───────┐  RDP 3389  ┌────────────┐
 │ Browser  │ ────────────────────────────────► │    Broker    │ ──────────────► │ guacd │ ─────────► │ Session VM │
 │ (canvas) │ ◄──────── filtered pixels ─────── │ (Node)       │                 └───────┘  (priv.    │ (ephemeral)│
 └──────────┘                                   │  · token     │                            subnet)   └────────────┘
@@ -53,7 +54,7 @@ Weekly reconciliation diffs Cost Explorer against `SUM(usage_records.compute_cos
 
 ## Data model (summary)
 
-Postgres via Prisma — see [services/api/prisma/schema.prisma](../services/api/prisma/schema.prisma). Key tables: `orgs`, `users`, `workspace_templates`, `workspace_images` (AMI + snapshot SHA-256 per build), `pool_instances` (state machine incl. `expires_at` on every instance), `sessions` (incl. `first_pixel_at` — the headline SLI — and `end_reason`), `session_events` (append-only), `recordings` (WORM metadata, `legal_hold`), `audit_log` (hash-chained), `plans` / `subscriptions` / `usage_records` / `stripe_events` (idempotent webhooks via unique event id), and the marketplace: `software_licenses` (HSM-sealed credential payload) and `license_rentals` (per-session rental ledger, pair-sealed credential, idempotent Stripe meter event id).
+Postgres via Prisma — see [services/api/prisma/schema.prisma](../services/api/prisma/schema.prisma). Key tables: `orgs`, `users`, `workspace_templates`, `workspace_images` (AMI + snapshot SHA-256 per build), `pool_instances` (state machine incl. `expires_at` on every instance), `sessions` (incl. `first_pixel_at` — the headline SLI — and `end_reason`), `session_events` (append-only), `recordings` (recording metadata and `legal_hold` flag), `audit_log` (hash-chain fields), `plans` / `subscriptions` / `usage_records` / `stripe_events` (unique event id for webhook idempotency), and the marketplace: `software_licenses` (software-key-sealed credential payload) and `license_rentals` (per-session rental ledger, pair-sealed credential, optional Stripe meter event id).
 
 ## Software marketplace (spec Layers 1–3)
 
@@ -83,7 +84,7 @@ Packer builds from a vendor base AMI in an isolated build VPC → Ansible provis
 
 ## Phase-0 deployment (current)
 
-Everything on one `t4g.small` in Docker Compose: API, broker, guacd, single-node Vault (KMS auto-unseal), Postgres, Redis, Caddy for TLS. No NAT Gateway (VPC endpoints / NAT instance), no pool (cold launches), AWS Budget alarm at $50. Production topology (3-node Vault Raft, RDS, ElastiCache, guacd ASG) arrives with the first paying tenant.
+Everything on one `t4g.small` in Docker Compose: API (which hosts the broker in-process), guacd, single-node Vault (KMS auto-unseal), Postgres, Redis, Caddy for TLS. No NAT Gateway (VPC endpoints / NAT instance), no pool (cold launches), AWS Budget alarm at $50. Production topology (3-node Vault Raft, RDS, ElastiCache, guacd ASG) arrives with the first paying tenant.
 
 ## Protocol adapters
 

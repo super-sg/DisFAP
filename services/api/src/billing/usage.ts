@@ -27,7 +27,15 @@ export interface UsageRecordData {
 }
 
 export interface UsageStore {
+  /**
+   * Persist exactly one usage row per session. Implementations MUST be
+   * idempotent under a duplicate `sessionId` (the Prisma adapter relies on the
+   * unique index on `usage_records.session_id`), because teardown retries are
+   * expected after a partial failure.
+   */
   createUsageRecord(data: UsageRecordData): Promise<void>;
+  /** Cheap pre-check so a retry does not even attempt a duplicate insert. */
+  hasForSession?(sessionId: string): Promise<boolean>;
 }
 
 /** Seconds the session was connected, clamped to >= 0. */

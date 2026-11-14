@@ -43,8 +43,15 @@ export class MockVaultServer {
 
   constructor() {
     this.server = createServer((req, res) => {
-      void this.handle(req, res);
+      // A client that times out aborts its socket while the handler may still
+      // be sleeping. That is expected (see the timeout test): swallow the
+      // resulting write/abort rejection instead of failing the whole suite
+      // with Vitest's unhandled-error check.
+      req.on('error', () => undefined);
+      res.on('error', () => undefined);
+      void this.handle(req, res).catch(() => undefined);
     });
+    this.server.on('clientError', (_err, socket) => socket.destroy());
   }
 
   async start(): Promise<string> {
@@ -80,8 +87,14 @@ export class MockVaultServer {
   }
 
   private send(res: ServerResponse, status: number, body: unknown): void {
-    res.writeHead(status, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(body ?? {}));
+    // The requester may have aborted during the artificial delay.
+    if (res.destroyed || res.writableEnded) return;
+    try {
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(body ?? {}));
+    } catch {
+      /* client went away mid-response */
+    }
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -147,11 +160,25 @@ export class MockVaultServer {
     }
 
     // GET /v1/<mount>/data/<path...>  — server-side KV v2 read (API's own token).
+    // With `X-Vault-Wrap-TTL`, Vault returns a response-wrapped READ handle and
+    // no plaintext at all (the credential re-issuance path).
     if (req.method === 'GET' && segs[0] === 'v1' && segs[2] === 'data') {
       const path = segs.slice(3).join('/');
       const data = this.kv.get(path);
       if (!data) {
         this.send(res, 404, { errors: ['not found'] });
+        return;
+      }
+      if (wrapTtl !== undefined) {
+        const ttl = Number(wrapTtl);
+        const wrapToken = `s.mock.${randomBytes(8).toString('hex')}`;
+        this.wraps.set(wrapToken, {
+          path,
+          data: { ...data },
+          expiresAtMs: Date.now() + ttl * 1000,
+          used: false,
+        });
+        this.send(res, 200, { wrap_info: { token: wrapToken, ttl } });
         return;
       }
       this.send(res, 200, { data: { data: { ...data }, metadata: { path } } });

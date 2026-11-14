@@ -36,7 +36,12 @@ interface Harness {
 
 async function harness(
   hsm: SoftwareHsm,
-  opts: { devAllowRerent?: boolean; terminateSession?: (sessionId: string) => Promise<{ state: string }> } = {},
+  opts: {
+    devAllowRerent?: boolean;
+    terminateSession?: (sessionId: string) => Promise<{ state: string }>;
+    /** Override the encrypted license credential payload (e.g. add demoOnly). */
+    licenseCreds?: Record<string, unknown>;
+  } = {},
 ): Promise<Harness> {
   const store = new InMemoryMarketplaceStore();
   const license = await store.create(OWNER, {
@@ -48,7 +53,7 @@ async function harness(
     hourlyRateUsd: 4.5,
     ownerName: 'Academic License Pool',
     templateId: 'tmpl_win_rdp',
-    encryptedCredentials: hsm.encrypt(JSON.stringify(LICENSE_CREDS)),
+    encryptedCredentials: hsm.encrypt(JSON.stringify(opts.licenseCreds ?? LICENSE_CREDS)),
   });
 
   const createSession = vi.fn(
@@ -323,5 +328,24 @@ describe('TwoThreadOrchestrator — Layer 3 rent flow', () => {
     // Exactly one createSession + one rental; the loser touched nothing.
     expect(h.createSession).toHaveBeenCalledTimes(1);
     expect((await h.store.findById(h.licenseId))?.status).toBe('rented');
+  });
+
+  it('forwards an explicit demo-credential declaration to createSession (evaluation path)', async () => {
+    const h = await harness(fastHsm(), { licenseCreds: { ...LICENSE_CREDS, demoOnly: true } });
+
+    await h.orchestrator.rentAndOrchestrate(PRINCIPAL, { licenseId: h.licenseId, hoursRequested: 1 });
+
+    const [, inputArg] = h.createSession.mock.calls[0]!;
+    expect((inputArg as CreateSessionInput).demoOnly).toBe(true);
+  });
+
+  it('does not declare a reusable credential demo-only when the listing omits the marker', async () => {
+    const h = await harness(fastHsm());
+
+    await h.orchestrator.rentAndOrchestrate(PRINCIPAL, { licenseId: h.licenseId, hoursRequested: 1 });
+
+    const [, inputArg] = h.createSession.mock.calls[0]!;
+    // Absent ⇒ the evaluation injector refuses to write it to userData.
+    expect((inputArg as CreateSessionInput).demoOnly).toBeUndefined();
   });
 });

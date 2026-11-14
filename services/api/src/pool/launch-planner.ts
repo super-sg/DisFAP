@@ -11,6 +11,8 @@ import type { PoolLaunchPlanner } from './pool-manager.js';
 export interface LaunchTemplateInfo {
   orgId: string;
   gpu: boolean;
+  os?: 'windows' | 'linux';
+  connectionProtocol?: 'rdp' | 'vnc' | 'dcv';
   /** Max session lifetime; drives the hard `expires_at`. */
   maxSessionS: number;
 }
@@ -30,6 +32,7 @@ export interface LaunchPlannerConfig {
   gpuHourlyCostUsd: number;
   /** Slack added to max_session_s so the reaper never races a live session. */
   expiryBufferS: number;
+  requireLinuxRdp?: boolean;
 }
 
 export class TemplateNotFoundError extends Error {
@@ -49,6 +52,9 @@ export class ConfiguredLaunchPlanner implements PoolLaunchPlanner {
   async plan(templateId: string, sessionId: string): Promise<{ spec: LaunchSpec; hourlyCostUsd: number }> {
     const info = await this.reader.load(templateId);
     if (!info) throw new TemplateNotFoundError(templateId);
+    if (this.config.requireLinuxRdp && (info.os !== 'linux' || info.connectionProtocol !== 'rdp')) {
+      throw new Error(`template ${templateId} is not compatible with the Linux RDP demo image`);
+    }
 
     const expiresAt = new Date(this.now().getTime() + (info.maxSessionS + this.config.expiryBufferS) * 1000);
     const spec: LaunchSpec = {

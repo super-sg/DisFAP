@@ -29,6 +29,16 @@ export interface IssuedCredential {
 
 export interface CredentialIssuer {
   issue(sid: string, credential: SessionCredentialMaterial, ttlSeconds: number): Promise<IssuedCredential>;
+  /**
+   * Issue a fresh single-use handle for the ALREADY STAGED credential, without
+   * writing it again and without the plaintext entering this process. Vault
+   * wraps a read of `pathFor(sid)`.
+   *
+   * Returns null when the persisted secret no longer exists, which callers must
+   * surface as "no connectable handle" (a revoked session must not be revived
+   * by a cached capability).
+   */
+  reissue(sid: string, ttlSeconds: number): Promise<IssuedCredential | null>;
   /** Best-effort revoke on session teardown. */
   revoke(sid: string): Promise<void>;
   /** Canonical Vault path for a session's credential. */
@@ -62,6 +72,13 @@ export class VaultCredentialIssuer implements CredentialIssuer {
     if (credential.privateKey !== undefined) data['private_key'] = credential.privateKey;
 
     const wrapped = await this.vault.writeWrappedSecret(path, data, ttlSeconds);
+    return { wrapToken: wrapped.wrapToken, vaultPath: path, expiresAt: wrapped.expiresAt };
+  }
+
+  async reissue(sid: string, ttlSeconds: number): Promise<IssuedCredential | null> {
+    const path = this.pathFor(sid);
+    const wrapped = await this.vault.wrapExistingSecret(path, ttlSeconds);
+    if (!wrapped) return null;
     return { wrapToken: wrapped.wrapToken, vaultPath: path, expiresAt: wrapped.expiresAt };
   }
 

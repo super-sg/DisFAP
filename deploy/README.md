@@ -1,8 +1,8 @@
 # DisFAP — Phase-0 all-in-one deployment
 
 Everything DisFAP needs, on **one `t4g.small`**, in Docker Compose: the control-plane
-**api**, the session **broker**, **guacd**, a single-node **Vault**, **Postgres**, **Redis**,
-and **Caddy** for TLS. This is the cheapest runnable topology (see
+**api** (which hosts the session **broker** in-process), **guacd**, a single-node **Vault**,
+**Postgres**, **Redis**, and **Caddy** for TLS. This is the cheapest runnable topology (see
 [`docs/architecture.md` §"Phase-0 deployment"](../docs/architecture.md)); the production
 topology (Vault Raft + KMS, RDS, ElastiCache, a guacd ASG) arrives with the first paying
 tenant.
@@ -14,16 +14,17 @@ tenant.
                     │     caddy      │   TLS termination + routing
                     └──┬─────┬─────┬─┘
              /         │  /api│     │ /tunnel (WebSocket)
-        ┌──────────────▼┐ ┌──▼─────┐ └─▼────────────┐
-        │      web      │ │  api   │  │   broker     │
-        │ (nginx, SPA)  │ │        │  │              │
-        └───────────────┘ └──┬─────┘  └──┬───────┬───┘
-                    edge net  │           │ edge  │ edge
+        ┌──────────────▼┐ ┌──▼─────┴──────────┐
+        │      web      │ │  api              │
+        │ (nginx, SPA)  │ │  + in-process     │
+        │               │ │    broker (:8080) │
+        └───────────────┘ └──┬───────┬────────┘
+                    edge net  │       │ edge
         ─────────────────────────────────────────────────  (internal: true) ──
-              internal net    │           │       │ 4822
-                    ┌─────────▼──┐ ┌───────▼─┐  ┌──▼────┐
-                    │  postgres  │ │  redis  │  │ vault │        guacd ──► session VMs
-                    └────────────┘ └─────────┘  └───────┘        (on `edge`, egress only)
+              internal net    │       │
+                    ┌─────────▼──┐ ┌──▼──────┐ ┌────────┐
+                    │  postgres  │ │  redis  │ │ vault  │        guacd ──► session VMs
+                    └────────────┘ └─────────┘ └────────┘        (on `edge`, egress only)
 ```
 
 **Only Caddy publishes host ports.** `guacd`, `postgres`, `redis`, and `vault` publish
@@ -66,7 +67,15 @@ make up            # docker compose up -d --build
 make ps            # watch services become healthy
 ```
 
-First run builds the `api`, `broker`, and `web` images from the repo root (npm workspaces).
+> **The `api` container exits until Vault has an AppRole for it** (step 3). That is
+> deliberate: there is no anonymous or in-memory fallback in production. `vault`,
+> `postgres`, `redis`, `guacd`, `web` and `caddy` are unaffected, so complete step 3
+> and run `make restart`.
+
+First run builds the `api` and `web` images from the repo root (npm workspaces).
+There is **no separate `broker` container**: the broker runs inside the API process
+because it needs the control plane's session resolver and Vault identity. See
+[`docs/security/architecture.md`](../docs/security/architecture.md).
 
 ### 3. Initialise & unseal Vault (one time)
 
@@ -83,10 +92,26 @@ docker compose exec vault vault operator unseal <UNSEAL_KEY_1>
 make vault-status  # should now show Sealed: false
 ```
 
-Put the **Initial Root Token** into `VAULT_TOKEN=` in `.env` and `make restart` so the api
-can talk to Vault. (Vault must be unsealed again after any `make down` + `make up`; existing
-sessions survive a Vault outage, but *new* session creation fails fast until it is unsealed —
-see [`docs/security.md`](../docs/security.md) "Known limitations".)
+Now create the least-privilege policies and the API's AppRole:
+
+```sh
+make vault-bootstrap
+```
+
+It prompts for the **Initial Root Token** (input hidden; it is never written to
+`.env` or an environment variable), creates the `disfap-api`/`disfap-broker`
+policies from `deploy/vault/policies/`, and prints a `VAULT_APPROLE_ROLE_ID` /
+`VAULT_APPROLE_SECRET_ID` pair. Paste those into `.env`, remove any `VAULT_TOKEN=`
+line, and `make restart`.
+
+**Do not give the application a root token.** Revoke the root token once
+bootstrap is done (`vault token revoke <token>`). A lost root token is
+recoverable with the unseal keys; a root token in `docker inspect` is a full
+compromise.
+
+(Vault must be unsealed again after any `make down` + `make up`; existing
+sessions survive a Vault outage, but *new* session creation fails fast until it
+is unsealed — see [`docs/security.md`](../docs/security.md) "Known limitations".)
 
 ### 4. Apply database migrations
 
@@ -174,13 +199,16 @@ phases** — those are enforced in the broker/guacd/image layers
 | File | Purpose |
 |---|---|
 | `docker-compose.yml` | The whole stack. Networks, volumes, healthchecks, ports. |
-| `Caddyfile` | Edge TLS + routing (`/`→web, `/api/*`→api, `/tunnel`→broker WS). |
+| `Caddyfile` | Edge TLS + routing (`/`→web, `/api/*`→api, `/tunnel`→api:8080 in-process broker). Also the CSP and security headers. |
 | `.env.example` | Every required variable, documented. Copy to `.env`. |
-| `Makefile` | `up`, `down`, `logs`, `migrate`, `gen-keys`, `psql`, … |
+| `Makefile` | `up`, `down`, `logs`, `migrate`, `vault-bootstrap`, `gen-keys`, `psql`, … |
 | `vault/config.hcl` | Phase-0 Vault server config (with the production WARNING). |
+| `vault/policies/api.hcl` | Scoped policy for the API's AppRole: sessions KV + wrapping only. |
+| `vault/policies/broker.hcl` | Unwrap-only policy, reserved for a split broker deployment. |
+| `vault/bootstrap.sh` | One-time, interactive: policies + AppRoles (root token never leaves the prompt). |
 | `web/nginx.conf` | SPA server config for the `web` container. |
-| `dockerfiles/api.Dockerfile` | Multi-stage build of `services/api` (control plane). |
-| `dockerfiles/broker.Dockerfile` | Multi-stage build of `services/broker` (gateway). |
+| `dockerfiles/api.Dockerfile` | Multi-stage build of `services/api` (control plane + broker). |
+| `dockerfiles/broker.Dockerfile` | Build of the broker package; **not run** in this stack (see below). |
 | `dockerfiles/web.Dockerfile` | Multi-stage build of `apps/web` → nginx static server. |
 | `dockerfiles/*.dockerignore` | Per-Dockerfile build-context excludes (BuildKit). |
 
@@ -194,19 +222,23 @@ Dockerfile — namely:
 - `@disfap/api` has a `build` script → `services/api/dist/server.js`, a Prisma schema at
   `services/api/prisma/schema.prisma`, exposes `/healthz`, and listens on `3000`.
 - `@disfap/web` has a Vite `build` script → `apps/web/dist`.
-- `@disfap/broker` (already committed) is compiled to `services/broker/dist/server.js`. For
-  the api to `import '@disfap/broker'` at runtime, the broker package must expose a JS
-  entrypoint (`main`/`exports` → its `dist`); that is a broker/api workspace concern, wired
-  centrally when those two land their composition root.
+- `@disfap/broker` is imported by the API through the workspace (`@disfap/broker/src/...`);
+  the api image therefore builds the broker package as part of the API build. The broker's
+  `main`/`exports` matter only for a standalone launch, which is refused.
 
 If a workspace's real conventions differ (script name, output dir), adjust the corresponding
 Dockerfile — those lines are commented for exactly this reason.
 
-### Known Phase-0 caveat: broker standalone start
+### Broker: in-process, not a container
 
-`services/broker/src/server.ts` intentionally **throws** on a standalone launch until
-`services/api` provides the control-plane `SessionResolver` + Vault `CredentialProvider` to
-`createBroker()`. Until that composition root is wired, the `broker` container will start and
-immediately exit, and `/tunnel` returns `502` at Caddy. The image/compose are already pointed
-at `node services/broker/dist/server.js`, so the broker goes live with **no change here** once
-that wiring lands.
+The broker is a library. It needs the control plane's Prisma session resolver and
+Vault credential provider, so `services/api/src/server.ts` constructs it with
+`createBroker()` and the API container listens on `BROKER_PORT` (8080) for the
+WebSocket. Caddy sends `/tunnel` there.
+
+`services/broker/src/server.ts` **refuses to start standalone**: it has no resolver
+and no Vault identity, and the previous version booted with empty in-memory stubs
+that answered `/healthz` 200 while rejecting every tunnel. A split deployment must
+first add an authenticated resolver endpoint and give the broker its own AppRole
+(`vault/policies/broker.hcl`) — see
+[`docs/security/architecture.md`](../docs/security/architecture.md).

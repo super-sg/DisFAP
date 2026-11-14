@@ -2,6 +2,18 @@
 
 This document is the canonical statement of what DisFAP guarantees, what it does not, and where each guarantee is enforced in code. It is written to double as the basis for customer security questionnaires.
 
+**Companion documents** (implementation detail, kept separate so this page stays
+a guarantee list):
+
+| Document | Contents |
+|---|---|
+| [security/architecture.md](security/architecture.md) | processes, ports, trust boundaries, session lifecycle, authorization matrix, fail-closed behaviour |
+| [security/secrets-management.md](security/secrets-management.md) | secret inventory, Vault AppRole + policies, lifecycle, rotation, delivery |
+| [security/threat-model.md](security/threat-model.md) | assets, actors, threats T1–T12, controls, residual risk |
+| [security/incident-response.md](security/incident-response.md) | what to do for each class of credential or boundary compromise |
+| [security/operations.md](security/operations.md) | startup guards, log signals, rate limits, backups, routine checks |
+| [configuration.md](configuration.md) | every environment variable, default and security guard |
+
 ## Threat model
 
 **Assets:** customer application data visible inside a session; session credentials; session recordings; the platform's own secrets.
@@ -35,6 +47,21 @@ Layer 2 is the load-bearing one and the only one we fully control at runtime. An
 
 The browser receives a 60-second, single-use, HMAC-SHA256-signed **handle** naming a session id — nothing else (see [adr/002](adr/002-opaque-token-over-guacamole-auth-json.md)). The broker resolves the handle server-side and fetches the VM credential from Vault with a response-wrapped, read-once token. Replayed handles terminate the session. Verification: a devtools network capture of a full session contains no hostname, username, or password in any payload.
 
+The credential exists in exactly one process and for one connect call. As soon as
+it has been written into the guacd handshake, the broker overwrites every copy it
+controls — the positional `connect` values, the connection-parameter map, and the
+provider's credential object ([secrets.ts](../services/broker/src/secrets.ts)).
+JS strings are immutable, so this bounds the plaintext's lifetime rather than
+claiming physical erasure; the distinction is restated under limitations.
+
+The broker→gateway channel itself is protected in production: `GUACD_TLS` must be
+on and `GUACD_CA` must pin the gateway's certificate, and the TLS client verifies
+it with `rejectUnauthorized: true` on TLS ≥1.2. guacd does not request client
+certificates, so this is authenticated, encrypted transport — not mutual TLS. The
+only way to run cleartext is to set `GUACD_ALLOW_CLEARTEXT=true`, which is an
+explicit assertion that guacd has no published port and is reachable solely over
+a private network (the single-host compose stack does this).
+
 ## Guarantee 3 — Session isolation
 
 - One security group per session; ingress only from guacd's SG on the RDP port; **no self-referencing rules** — tenant VMs can never reach each other.
@@ -44,7 +71,7 @@ The browser receives a 60-second, single-use, HMAC-SHA256-signed **handle** nami
 
 ## Guarantee 4 — Ephemerality
 
-VMs boot from an offline-hardened golden image whose AMI id and snapshot SHA-256 are recorded per session, and are **destroyed, never reused** ([adr/004](adr/004-burn-after-reading-vms.md)). Five independent teardown layers ensure destruction happens even under total control-plane failure.
+VMs boot from an offline-hardened golden image whose AMI id and snapshot SHA-256 are recorded per session, and are **destroyed, never reused** ([adr/004](adr/004-burn-after-reading-vms.md)). Five independent teardown layers ensure destruction happens even under total control-plane failure. The root EBS volume is requested with `Encrypted: true` and `DeleteOnTermination: true` ([provider.ts](../services/api/src/cloud/provider.ts)); because the per-launch block-device mapping overrides the launch template's, `Encrypted` is set explicitly rather than inherited. Erasure is delete-with-the-instance under encryption at rest — no overwrite pass is claimed.
 
 ## Guarantee 5 — Tamper-evident audit
 
@@ -187,6 +214,22 @@ materialize the credential).
 > certs + a live IMDS document) is validated. See
 > [runbooks/guest-provisioning.md](runbooks/guest-provisioning.md).
 
+## Guarantee 9 — The control plane holds no Vault administrator credential
+
+The application authenticates to Vault with a scoped AppRole and never with a
+root token.
+
+| Layer | Enforcement |
+|---|---|
+| Identity | `AppRoleTokenSource` logs in with `role_id`/`secret_id`, caches the short-lived token, re-mints before expiry, and fails closed on rejection ([vault-auth.ts](../services/api/src/vault/vault-auth.ts)) |
+| Authorization | `disfap-api` policy limited to `secret/data/sessions/*`, `secret/metadata/sessions/*` (delete only) and wrapping/unwrapping ([api.hcl](../deploy/vault/policies/api.hcl)); `disfap-broker` is unwrap-only |
+| Provisioning | `make vault-bootstrap` prompts for the root token interactively, never writes it to `.env`, and prints the scoped role credentials ([bootstrap.sh](../deploy/vault/bootstrap.sh)) |
+| Transport | production requires `https://` for `VAULT_ADDR` unless `VAULT_ALLOW_HTTP=true` explicitly acknowledges a private-only hop |
+| Blast radius | a leaked token can only touch one session's secret inside the `sessions/` prefix; it cannot read another mount, manage policies, or mint tokens |
+
+Tests: [vault-auth.test.ts](../services/api/test/vault-auth.test.ts),
+[config.test.ts](../services/api/test/config.test.ts).
+
 ## Known limitations (stated, not hidden)
 
 - Pixels on a screen can be photographed. Watermarking (per-session, per-user overlay) makes leaks attributable, not impossible.
@@ -219,15 +262,44 @@ materialize the credential).
   [runbooks/key-management.md](runbooks/key-management.md) §5 — **not executed**,
   because it cannot be validated without a real Vault.
 - **The Vault HTTP adapter is not validated against real Vault.** `HttpVaultClient`
-  is a real KV-v2 + response-wrapping implementation (auth from config, timeouts,
-  no secret/token logging) exercised against a local **mock** Vault server. It has
-  not been run against a live cluster.
+  is a real KV-v2 + response-wrapping implementation (AppRole or static token,
+  timeouts, path validation, no secret/token logging) exercised against a local
+  **mock** Vault server. It has not been run against a live cluster, and the
+  policies in [../deploy/vault/policies](../deploy/vault/policies) have not been
+  applied to a real Vault.
+- **Vault audit logging is not configured.** The repo creates no audit device;
+  Vault-side read/deny forensics requires the operator to enable one.
+- **Connect-token replay protection is process-local unless `REDIS_URL` is set.**
+  With Redis the burn list survives restarts ([redis-nonce-store.ts](../services/broker/src/redis-nonce-store.ts));
+  without it a broker restart forgets burned jtis for up to the 60 s token TTL,
+  so a leaked-but-unused token could be replayed once. The API logs a production
+  warning when Redis is absent.
+- **The broker is not a separate service.** It runs inside the API process
+  because it needs the control plane's session resolver and Vault identity. The
+  standalone entrypoint now refuses to start instead of booting with empty
+  stubs; a split deployment requires an authenticated resolver endpoint that does
+  not exist yet.
+- **Rate limiting is per-process, per-IP.** It is an abuse brake (session
+  creation, rentals, guest provisioning) and not a distributed quota; a
+  multi-node deployment needs a shared counter.
+- **The demo marketplace catalog is development-only.** Its seed credentials are
+  generated per process (never literals in source) and seeding is skipped in
+  production; an existing database keeps whatever it was seeded with.
 - **Production now fails closed on missing durable providers.** A production
-  deploy without `DFAP_CREDENTIAL_KEY_FILE`/`_PEM`, `DFAP_PAIR_MASTER_KEY`, or
-  `VAULT_ADDR`/`VAULT_TOKEN` refuses to boot rather than silently using an
-  ephemeral key, a non-secret dev pair seed, or an in-memory Vault.
+  deploy without `DFAP_CREDENTIAL_KEY_FILE`/`_PEM`, `DFAP_PAIR_MASTER_KEY`, or a
+  Vault identity (`VAULT_APPROLE_ROLE_ID`/`SECRET_ID` preferred, `VAULT_TOKEN`
+  fallback) refuses to boot rather than silently using an ephemeral key, a
+  non-secret dev pair seed, or an in-memory Vault.
 - **Plaintext is bounded, not force-zeroed.** Clearing a string or setting a field
-  to null does not guarantee physical erasure from memory.
+  to null does not guarantee physical erasure from memory. What *is* done: the
+  broker overwrites the `connect` values, the guacd parameter map and the
+  provider's credential object immediately after the handshake
+  ([secrets.ts](../services/broker/src/secrets.ts)), so no reference we control
+  outlives the connect call. Buffers, where we hold them, are zero-filled.
+- **guacd transport is authenticated one-way.** guacd does not request client
+  certificates, so the broker→guacd leg cannot be described as mTLS: TLS with a
+  pinned CA (required in production) authenticates and encrypts, and the
+  remaining assurance comes from keeping guacd off published ports.
 - **Guest credential provisioning is not production-enabled.** The
   instance-identity verifier, the server-side binding, the delivery path and the
   guest `dfap-provision.service` are implemented and tested against generated
@@ -246,3 +318,27 @@ materialize the credential).
 - **Guest cleanup is best-effort.** `dfap-deprovision.sh` narrows the window in
   which a still-live instance holds a usable account; the authoritative cleanup
   is VM destruction (burn-after-reading, encrypted root).
+
+## Appendix — Patent-specification traceability
+
+The working [specification](specifications/system-and-method-zero-exposure-credential-injection.docx) is *System and Method for Secure Session Brokering with
+Zero-Exposure Credential Injection in Virtual Machines*. Every security claim in
+it is mapped below to the code that enforces it, so conformance can be audited
+rather than asserted. Status: **enforced** (code + tests), **partial** (the
+guarantee holds with a narrower mechanism than described), or **not implemented**
+(stated in "Known limitations" above).
+
+| # | Measure in the specification | Where it is enforced | Status |
+|---|---|---|---|
+| 1 | No sensitive data exists or travels to the client; the browser receives only translated HTML5 pixels | guacd lockdown parameters ([guacd-client.ts](../services/broker/src/protocol/guacd-client.ts)), the client→guacd allowlist and guacd→client stream filter ([instruction-filter.ts](../services/broker/src/instruction-filter.ts)), no `onfile`/`onclipboard` handlers in [SessionView.tsx](../apps/web/src/session/SessionView.tsx) | Enforced |
+| 2 | The client holds no tokens or session keys — only an opaque single-use handle | 60 s HMAC-SHA256 handle ([session-token.ts](../services/broker/src/session-token.ts)); sent as the first WebSocket frame, never in a URL or query; replay terminates the session ([tunnel.ts](../services/broker/src/tunnel.ts)); nothing written to browser storage | Enforced |
+| 3 | Owner credentials are encrypted with an RSA-4096 HSM key and stored in HashiCorp Vault, bounding plaintext lifetime | RSA-4096-OAEP seal under the Layer-2 key ([hsm-rsa.ts](../services/api/src/crypto/hsm-rsa.ts)); plaintext exists only inside the request that writes or reads it ([marketplace routes](../services/api/src/http/routes/marketplace.ts)) | **Partial** — software key provider (no HSM/KMS) and the sealed blob lives in Postgres, not Vault; migration runbook written, not executed |
+| 4 | Every owner–rentee pair gets a unique key derived from both ids | HKDF over `(ownerId, renteeId)` in [pair-keys.ts](../services/api/src/crypto/pair-keys.ts) | Enforced |
+| 5 | The orchestrator spawns two concurrent threads: provision the VM, retrieve the credential | Parallel claim/launch and credential staging in [create-session.ts](../services/api/src/sessions/create-session.ts) | Enforced |
+| 6 | Authentication material is written to the VM disk **before** boot | Eval path: [disk-injector.ts](../services/api/src/cloud/disk-injector.ts) / cloud-init. Production: instance-identity guest provisioning, fetched after first boot with RDP held closed until provisioned ([guest-provisioning route](../services/api/src/http/routes/guest-provisioning.ts)) | **Deviation, deliberate** — the pre-boot key would have to live in a reusable AMI. Production is fail-closed; see Guarantee 8 |
+| 7 | The gateway slips the credential into the RDP/VNC handshake server-side | `buildProtocolParams` → `connect` instruction ([guacd-client.ts](../services/broker/src/protocol/guacd-client.ts)) | Enforced |
+| 8 | After the handshake, the gateway wipes the credential from memory | Connect values, parameter map and the provider's object are overwritten in place ([secrets.ts](../services/broker/src/secrets.ts), [tunnel.ts](../services/broker/src/tunnel.ts)), on success and on handshake failure | Enforced (bounded lifetime — see limitations) |
+| 9 | Plaintext goes to the gateway over a mutually verified channel | Production requires `GUACD_TLS=true` and `GUACD_CA` pinning with `rejectUnauthorized: true` / TLS ≥1.2 ([config.ts](../services/broker/src/config.ts)); cleartext needs an explicit `GUACD_ALLOW_CLEARTEXT=true` acknowledgement | **Partial** — authenticated and encrypted, but guacd requests no client certificate, so not mutual |
+| 10 | On end or revocation the WebSocket closes, the VM is destroyed and its disks are wiped | [end-session.ts](../services/api/src/sessions/end-session.ts) terminates the instance; the tunnel closes the browser socket when the upstream dies; root volume requested `Encrypted: true` + `DeleteOnTermination: true` ([provider.ts](../services/api/src/cloud/provider.ts)) | Enforced (cryptographic erasure by key destruction + volume deletion; no overwrite pass claimed) |
+| 11 | Access ends automatically when the rental period expires | Lease expiry in the session reaper, plus credential revocation in `endSession` | Enforced |
+| 12 | The vault confirms the rentee's access permissions before releasing the bundle | Authorization (marketplace claim, quota, tenant scope) runs in the control plane **before** the credential is staged and the wrap token is minted ([create-session.ts](../services/api/src/sessions/create-session.ts)); the token is read-once at the broker | **Partial** — authorization is application-level, not a Vault policy; Vault enforces read-once |

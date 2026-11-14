@@ -104,6 +104,53 @@ describe('reconnectDelayMs', () => {
   });
 });
 
+describe('expired — terminal server side', () => {
+  it('EXPIRED latches from a live state and clears the channel flag', () => {
+    const live = run([{ type: 'ALLOCATE' }, { type: 'READY' }, { type: 'SOCKET_OPEN' }, { type: 'FIRST_FRAME' }]);
+    const expired = transition(live, { type: 'EXPIRED', reason: 'session ended' });
+    expect(expired.state).toBe('expired');
+    expect(expired.channelOpen).toBe(false);
+    expect(expired.error).toBe('session ended');
+  });
+
+  it('EXPIRED from a dropped session is terminal (no retry budget applies)', () => {
+    const dropped = run([{ type: 'ALLOCATE' }, { type: 'READY' }, { type: 'FIRST_FRAME' }, { type: 'SOCKET_CLOSED', transient: true }]);
+    expect(dropped.state).toBe('disconnected');
+    const expired = transition(dropped, { type: 'EXPIRED' });
+    expect(expired.state).toBe('expired');
+    expect(expired.error).toBe('this session has ended');
+  });
+
+  it('nothing revives an expired session except RESET', () => {
+    const expired = transition(initialContext, { type: 'EXPIRED' });
+    for (const ev of [
+      { type: 'ALLOCATE' },
+      { type: 'READY' },
+      { type: 'RECONNECT' },
+      { type: 'SOCKET_CLOSED', transient: true },
+      { type: 'SOCKET_OPEN' },
+      { type: 'FIRST_FRAME' },
+    ] as const) {
+      expect(transition(expired, ev)).toBe(expired);
+    }
+    expect(transition(expired, { type: 'RESET' })).toEqual(initialContext);
+  });
+
+  it('does not reconnect after an intentional end while still connectable', () => {
+    const ctx = run([
+      { type: 'ALLOCATE' },
+      { type: 'READY' },
+      { type: 'FIRST_FRAME' },
+      { type: 'SOCKET_CLOSED', transient: false },
+      { type: 'RECONNECT' },
+    ]);
+    // RECONNECT is legal from disconnected, but no attempt was counted and the
+    // UI uses the non-transient close to route back to the launcher.
+    expect(ctx.reconnectAttempts).toBe(0);
+    expect(ctx.state).toBe('connecting');
+  });
+});
+
 describe('SessionMachine', () => {
   it('notifies subscribers only on real transitions', () => {
     const m = new SessionMachine();

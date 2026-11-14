@@ -12,7 +12,7 @@ Companion documents:
 - `docs/runbooks/aws-first-session.md` — the real-AWS onboarding runbook.
 - `docs/runbooks/oidc-production-onboarding.md` — connecting a real OIDC provider
   (production authentication onboarding).
-- `System and Method for Secure Session Brokering with Zero.docx` — the source spec.
+- [`docs/specifications/system-and-method-zero-exposure-credential-injection.docx`](docs/specifications/system-and-method-zero-exposure-credential-injection.docx) — the source spec.
 
 Revision history:
 
@@ -27,8 +27,12 @@ Revision history:
 | r6 | 2026-10-16 | M6 — end-to-end OIDC authentication (browser code+PKCE, provisioning CLI) | **366** (+5 skipped) |
 | r7 | 2026-10-16 | M7 — durable key management & credential-storage correctness | **418** (+7 skipped) |
 | r8 | 2026-10-16 | M8 — guest credential provisioning (C3): per-instance identity, fail-closed guest unit | **473** (+7 skipped) |
+| r9 | 2026-10-19 | **Real-AWS milestone** — EC2 lifecycle hardening + truthful status corrections (see §4.10) | **528** (+7 skipped) |
+| r10 | 2026-10-28 | **Repository productionization** — modular HTTP/repo layers, CI, config consolidation, four trust-boundary fixes (see §4.11) | **553** (+7 skipped) |
+| r11 | 2026-10-28 | **Patent-spec conformance** — gateway credential wipe, pinned TLS to guacd in production, encrypted session root volume (see §4.12) | **570** (+7 skipped) |
+| r12 | 2026-10-28 | **Secrets-management & end-to-end security** — Vault AppRole + scoped policies, Redis replay store, broker config unification, abuse limits, CSP, seed/credential hygiene (see §4.13) | **635** (+7 skipped) |
 
-Last updated: 2026-10-16 (rev r8)
+Last updated: 2026-10-28 (rev r12)
 
 ---
 
@@ -59,10 +63,10 @@ with Zero-Exposure Credential Injection in Virtual Machines") is **implemented,
 audited, remediated, and verified locally** on the fake cloud + software HSM +
 dev Vault. **No AWS credentials are needed for any of it.**
 
-Current, verified state (rev r8):
+Current, verified state (rev r10):
 
 - `npm run typecheck` — **clean** across api + broker + web.
-- `npm test` — **473 passed, 7 skipped** (api **337** · broker 95 · web 41; the 7
+- `npm test` — **570 passed, 7 skipped** (api **410** · broker **114** · web 46; the 7
   skips are the PostgreSQL-backed persistence tests, which run only when
   `DFAP_TEST_DATABASE_URL` is set).
 - `npm run build --workspace=@disfap/api` (`prisma generate && tsc`) — **succeeds**.
@@ -90,8 +94,23 @@ validated credential-key lifecycle** (a real key id, validated modulus/algorithm
 rotation via decrypt-only retired keys, restart persistence) with a hardened
 Vault adapter and cleanup obligations for rental-scoped re-seals.
 
-What is **not** done and is **not** claimed to work: the real AWS/EC2 path (stub),
-the **real-AWS validation of guest provisioning** (the instance-identity verifier,
+**Corrected in r9 (§4.10):** the real AWS/EC2 path is **no longer a stub**. It is
+implemented over `@aws-sdk/client-ec2` and has been exercised against a real
+account end to end — a session reached `ready` on a real instance and the real
+XFCE desktop streamed through the broker (`docs/runbooks/demo-evaluation.md`).
+
+**Hardened in r10 (§4.11):** an engineering pass over the whole repository —
+routes and Prisma repositories split into focused modules, the launch page
+decomposed, CI added, configuration consolidated and documented, and four
+defects found and fixed while auditing the HTTP trust boundary (5xx bodies leaked
+internal error text; any same-org peer could read a session *and receive its
+connect handle*, or end it; a rental duration was unbounded and could be
+non-finite; the API accepted a signing key the broker would reject). No route,
+env var, DB field, event name, or response shape was removed or renamed, and no
+behaviour was weakened to make a check pass.
+
+What is **not** done and is **not** claimed to work: the **real-AWS validation of
+the guest provisioning unit** (the instance-identity verifier,
 binding and fail-closed guest unit are built and unit-tested against generated
 keys/fakes, but real VM isolation is unproven and `DFAP_GUEST_PROVISIONING=
 instance-identity` is refused in production), any
@@ -859,6 +878,297 @@ real Vault; production guest provisioning deliberately **off**.
 
 ---
 
+### 4.10 — Real-AWS milestone: EC2 lifecycle hardening & truthful status (rev r9)
+
+**Trigger.** Rev r8 (and §1/§7/§8) described `AwsCloudProvider` as "a stub" and
+the real EC2 path as unverified. That was **already false**. The provider is
+implemented over `@aws-sdk/client-ec2`, and on 2026-10-17 a real instance
+(`i-06e22fd3b9ae3eabb`, `t4g.small`, `ap-south-1b`) was launched through the
+control plane, a session reached `ready`, and the real XFCE desktop streamed
+through the broker to a Guacamole client. Evidence: `docs/runbooks/demo-evaluation.md`.
+Nothing in this milestone makes that path exist — it closes the gaps the real run
+exposed.
+
+**Numbering note.** The roadmap calls this milestone "M8 — real AWS
+provisioning", while §4.9 already used "M8" for guest credential provisioning.
+This entry leaves the §4.9 label intact and refers to the work by name.
+
+**Defects found by the real run (all fixed earlier, recorded here):**
+
+1. **The broker dropped the guacd protocol version.** guacd 1.6.0 lists
+   `VERSION_1_5_0` as the first element of `args`; the broker sent
+   `instr.args.slice(1)`, so every `connect` value shifted by one — the hostname
+   was read as the version and the port was dialled as a hostname. guacd replied
+   `RDP server closed/refused connection (wrong security type?)`, which pointed at
+   xrdp rather than at the real cause. (`services/broker/src/protocol/guacd-client.ts`)
+2. **The connect host was the private IP.** `RunInstances` usually omits
+   `PublicIpAddress` while the instance is pending, so the pool row kept the
+   private IP — unreachable from a broker running outside the VPC. The readiness
+   reconciler already resolves the address EC2 actually reports, so it now
+   persists that verified host (`markConnectHost`); the row self-heals to the
+   public IP on promotion. (`pool/readiness.ts`, `ports.ts`, `db/prisma-repos.ts`)
+3. **cloud-init ran the desktop installer under dash**, so `set -o pipefail`
+   aborted it and 3389 never opened; and per-user `write_files` failed with
+   `Unknown user or group`. Both fixed in `cloud/cloud-init-injector.ts`.
+
+**Hardening added this milestone (the actual M8 gaps):**
+
+- **Partial-launch cleanup.** `PoolManager.claim` ran `RunInstances` and then
+  inserted the pool row; when that insert threw, the VM was billing with no row
+  to bound its life and nothing for the reaper to see (its orphan path would only
+  find it after `ORPHAN_GRACE_MS` = 15 min). The insert is now wrapped and the
+  instance terminated in place before the database error is rethrown.
+- **Launch idempotency.** The SDK retries transient `RunInstances` failures; with
+  no token each retry creates another billable instance. `RunInstances` now
+  carries `ClientToken: dfap-<sessionId>`.
+- **Not-found is not a failure.** `InvalidInstanceID.NotFound` (EC2 purges a
+  terminated instance after ~1h) now reads as `null` from `describeInstance` —
+  matching the documented port — and as success from `terminateInstance`. A throw
+  from `describeInstance` previously aborted an entire readiness pass.
+- **Per-session isolation in the reconciler.** One session's EC2 throttle or
+  transient DB error can no longer stall every other pending session; that
+  session stays `allocating`, is retried, and is never promoted or failed on a blip.
+- **Fleet view excludes dead states.** `describeManaged` now asks EC2 only for
+  `pending,running,stopping,stopped`, so terminated instances (visible ~1h) are
+  not re-terminated and re-logged on every reaper pass.
+- **One EC2 client per provider.** Previously a fresh `EC2Client` was built per
+  call, re-resolving credentials each time.
+- **Docs made truthful.** The "STUB — Phase-1" headers on `AwsCloudProvider` are
+  gone; they were the opposite of the code and were read as fact by r8.
+
+**Verification.** `npm run typecheck` clean (api/broker/web); `npm test`
+**528 passed, 7 skipped** (api **390** · broker **97** · web **41**); `npm run
+build` green (prisma generate + api/broker tsc + vite build). New coverage:
+`test/provider.test.ts` — 18 tests driving the real EC2 request/response handling
+against an injected client (launch success, pending shape with no addresses,
+missing instance id, AWS error, terminate, not-found idempotency, describe,
+fleet tags + state filter, client reuse) — plus partial-launch cleanup in
+`pool-manager.test.ts` and per-session isolation in `readiness.test.ts`.
+**No schema change.** Nothing committed.
+
+**Honest limits.** The injected-client tests are *not* real-AWS evidence; the real
+evidence is the 2026-10-17 manual run. There is **no** automated integration test
+that talks to EC2 (the IAM Identity Center token lives ~1h and there is no
+cost-gated CI), so "works" rests on that run plus unit-level request shaping. The
+AMI/instance type in `.env` are validated for architecture compatibility, but the
+**launch template owns the actual values**, so a drifted template would launch
+something else — see §8.
+
+---
+
+### 4.11 — Repository productionization pass (rev r10)
+
+A whole-repository engineering pass, deliberately **not** a rewrite: no new
+frameworks, no new dependencies, no service split, and no change to the database
+schema. The goal was that a new engineer can find the right file, that the
+trust boundary is enforced in code (not in comments), and that CI proves it.
+
+**Structure.** The four largest modules were the ones that mixed concerns.
+
+| Before | After | Why |
+|---|---|---|
+| `src/app.ts` (384) — every route in one closure | `app.ts` is now wiring only (error mapping, CORS, mounting); routes live in `src/http/routes/{health,templates,marketplace,sessions,guest-provisioning,billing}.ts`, shared shapes in `src/http/contracts.ts`, presentation/authorization in `src/http/session-view.ts` | "where do I add an endpoint" had one answer, and authorization could not be reviewed independently of routing |
+| `src/db/prisma-repos.ts` (537, 13 classes) | `src/db/repos/{shared,session,identity,audit,pool,billing}.ts` + `index.ts` barrel | one file per concern, while keeping **a single import surface** (`db/repos/index.js`) so no caller changed shape |
+| `apps/web/src/session/LaunchPage.tsx` (523) | page shell + `useCatalog`, `useSessionLaunch`, `LaunchProgress`, `OwnerListingForm`, `launch-types` | the page mixed three tabs, two async flows and a form; the launch state machine is now testable in isolation |
+| `src/config.ts` + ad-hoc `process.env` reads in `server.ts` | `readyTimeoutS`, `readyProbePort`, `evalSshPublicKey` moved into the validated config; `DFAP_READY_TIMEOUT_S`/`DFAP_READY_PROBE_PORT` are range-checked at boot | configuration had two authorities; a typo in a tuning knob was silently ignored |
+
+**Defects found by auditing the trust boundary** (all fixed, all with tests in
+`services/api/test/http-hardening.test.ts` and `test/config.test.ts`):
+
+1. **5xx leaked internal detail.** The error handler's comment said 5xx never
+   leaks internals; the code returned `detail: err.message`. A database or
+   network error would have returned driver text and hostnames to the caller.
+   Now 4xx keeps its actionable message, 5xx returns `{error: "internal_error"}`
+   and the detail goes to the log.
+2. **Same-tenant peers could take over each other's desktops.** `GET
+   /sessions/:id` checked org membership only, then returned a freshly minted
+   single-use connect handle — a handle that authenticates *as the renter* at the
+   broker. Any member of the same org could read a colleague's session and drive
+   their VM. Reading is now renter-of-record only; *ending* is renter **or** a
+   tenant admin/owner (operational recovery), and a cross-tenant caller still
+   gets a flat `403`.
+3. **`hoursRequested` was unbounded and could be non-finite.** `Math.max(1, x)`
+   clamped the floor, so `1e9` hours produced an absurd charge and a lease that
+   never ends; `Infinity` (JSON `1e309`) produced `NaN`/`Infinity` money.
+   The route now requires an integer in `1..24` (`MAX_RENTAL_HOURS`, matching the
+   UI's 1/2/4/8 choice) and rejects anything else with `400` before the
+   orchestrator runs.
+4. **The API accepted signing keys the broker rejects.** The broker enforces a
+   32-byte HMAC key floor; the API minted tokens with whatever it was given. The
+   API now enforces the same floor at boot.
+
+**Hygiene.** `.github/workflows/ci.yml` (install → prisma generate → typecheck →
+test → build; no cloud credentials, no database service, no deploy step),
+`.env.example` (safe local template), `docs/configuration.md` (every variable,
+default and guard), and an accurate `README.md` (prerequisites, real ports,
+commands, a map of "where to change things", and an explicit statement of which
+tests are mocked versus real).
+
+**Compatibility.** No route, method, status code, response field, env var name,
+DB field, event name, auth claim, or config key was removed or renamed. The only
+behavioural changes are *tightenings* at the trust boundary listed above. The
+`ApiServices`, `SessionView`, `ApiTemplate` and `BuildAppOptions` types are still
+exported from `app.ts`, so `server.ts` and the existing tests did not change their
+imports.
+
+**Verification.** `npm run typecheck` clean; `npm test` **553 passed, 7 skipped**
+(api **410**, broker 97, web 46 — up from 528, the increase being the new
+hardening and config tests); `npm run build` green. Nothing committed.
+
+---
+
+### 4.12 — Patent-specification conformance pass (rev r11)
+
+The working specification (`System and Method for Secure Session Brokering with
+Zero-Exposure Credential Injection in Virtual Machines`) was read claim by claim
+and each *security* measure was mapped to the code that enforces it. The full
+mapping is now an appendix in [docs/security.md](docs/security.md) ("Patent-
+specification traceability") so the next reader does not have to redo it.
+
+Of the eleven security claims, eight were already implemented and covered by
+tests (pixel-only client, server-side credential fetch, per-pair derived key,
+ephemeral VM + `DeleteOnTermination`, WebSocket close on teardown, single-use
+handle + replay termination, tenant-scoped control plane, fail-closed guest
+provisioning). Three were **not** — or existed only as prose. They are now
+implemented:
+
+1. **"guacamole wipes the credential data from its memory."** The credential was
+   fetched, copied into the guacd parameter map, and both the map and the
+   provider's object stayed reachable for the whole connection. New
+   `services/broker/src/secrets.ts` overwrites in place: the positional `connect`
+   values, the secret-bearing connection parameters, and (from `tunnel.ts`) the
+   credential object the provider handed over — on the success path *and* when
+   the handshake fails. JS strings cannot be zeroed, so the doc states "bounded
+   lifetime", not erasure; that honesty was already the documented rule.
+2. **"the plaintext data is sent … over a mutually verified channel."** The
+   broker→guacd socket was cleartext by default with no production guard, in a
+   stack whose own comment said "mTLS is a production concern". Now: in
+   production `GUACD_TLS` must be `true` and `GUACD_CA` must pin the gateway's
+   certificate (verified with `rejectUnauthorized: true`, TLS ≥1.2); cleartext
+   boots only when `GUACD_ALLOW_CLEARTEXT=true` says so explicitly, and always
+   logs a warning. guacd does not request client certificates, so this is
+   authenticated+encrypted transport, **not** mTLS — stated as such everywhere
+   rather than overclaimed.
+3. **"destroyed along with the disks being wiped."** `RunInstances` now sets
+   `Encrypted: true` on the root volume. This was a real latent downgrade: the
+   per-launch `BlockDeviceMappings` entry **replaces** the launch template's for
+   that device, so a template that encrypted its volume was silently overridden
+   by an unencrypted mapping. `docs/security.md` had claimed "encrypted root".
+
+Also fixed while writing the guard: `services/broker/src/config.ts` read
+`DFAP_SIGNING_KEYS` and the TLS switches from the passed `env` but everything
+else from `process.env`, so config could not be tested (or injected) as a whole.
+All reads now go through the single `env` argument.
+
+**Deliberately not implemented, with reasons** (all documented in
+`docs/security.md` → limitations): a hardware HSM (the spec names Thales Luna;
+the code has a software RSA-4096 provider), moving *owner* credentials from
+Postgres into Vault (requires a real Vault to validate; runbook exists), and
+pre-boot offline disk injection in production (deliberately replaced by
+instance-identity guest provisioning, because the pre-boot key would have to be
+baked into a reusable AMI).
+
+**Compatibility.** Dev defaults unchanged; `.env` (`DFAP_ENV=development`) loads
+exactly as before. One new optional variable, `GUACD_ALLOW_CLEARTEXT`, is set in
+`deploy/docker-compose.yml` for the single-host stack (guacd publishes no port),
+so the reference deployment keeps booting. No route, schema, event, claim, or
+existing variable changed.
+
+**Verification.** `npm run typecheck` clean; `npm test` **570 passed, 7 skipped**
+(api **410**, broker **114** — +17 new config/secrets/wipe tests, web 46);
+`npm run build` green. Guard matrix executed against the built config:
+development → ok (tls off); production + cleartext → refused; production +
+explicit acknowledgement → ok; production + TLS without CA → refused; production
++ TLS + pinned CA → ok.
+
+---
+
+### 4.13 — Secrets-management and end-to-end security pass (rev r12)
+
+A second security pass, focused on the *secrets architecture* rather than the
+patent claims. It started by tracing what Vault integration actually existed —
+not what the directory names and env templates suggested.
+
+**What the audit found (and fixed):**
+
+1. **The application was told to run with the Vault root token.**
+   `deploy/README.md` + `.env.example` instructed the operator to paste the
+   initial root token into `VAULT_TOKEN`, and the API used it for every write,
+   read and revoke. Now: `AppRoleTokenSource`
+   ([vault-auth.ts](services/api/src/vault/vault-auth.ts)) logs in with a
+   role_id/secret_id, caches a short-lived token (≤5 min), re-authenticates
+   before expiry, single-flights concurrent logins, and retries a 403 exactly
+   once after re-auth. Policies are files
+   ([deploy/vault/policies/api.hcl](deploy/vault/policies/api.hcl): sessions
+   data + metadata-delete + wrapping only) and a one-time interactive
+   [bootstrap.sh](deploy/vault/bootstrap.sh) (`make vault-bootstrap`) creates the
+   roles and prints the scoped credentials. The root token has no place in the
+   app environment anymore.
+2. **The in-process broker bypassed every broker guard.** `buildBrokerConfig()`
+   in `services/api/src/server.ts` hand-parsed the env and ignored
+   `GUACD_CA`/`CERT`/`KEY`, so the *running* broker could use cleartext guacd in
+   production with a short signing key while the standalone parser refused. It
+   now delegates to the broker's own `loadConfig`
+   ([broker-config.test.ts](services/api/test/broker-config.test.ts)).
+3. **The standalone broker was silently broken.** It booted with
+   `InMemorySessionResolver` + `StaticCredentialProvider`, answered `/healthz`
+   200, and rejected every tunnel with 4003; compose routed `/tunnel` to it.
+   The entrypoint now refuses to start with an explanation, and compose routes
+   `/tunnel` to `api:8080` where the broker actually runs.
+4. **`REDIS_URL` was parsed and never used**, while the compose file claimed
+   Redis held the jti burn list. New
+   [redis-nonce-store.ts](services/broker/src/redis-nonce-store.ts) speaks the
+   minimal RESP subset (`AUTH`, `SELECT`, `SET NX EX`), is wired from the same
+   config, and fails closed. `tunnel.ts` no longer lets a nonce-store rejection
+   escape as an unhandled promise rejection (which would have crashed the
+   process) — it terminates the connection instead.
+5. **Hardcoded demo credentials in source** (`DisFAP_Session_Password_2026!`
+   and three siblings) were sealed into the marketplace seed catalog on every
+   empty database. They are now generated per process, and seeding is skipped in
+   production (a demo catalog must not appear in a real marketplace).
+6. **Vault paths could escape the sessions prefix.** `revoke` issues `DELETE
+   <mount>/metadata/<path>`; a session id containing `..` would have addressed
+   another secret. Every path segment is now validated
+   (`assertSafeSecretPath`), in the fake client too.
+7. **No abuse controls on expensive or unauthenticated endpoints.** Added a
+   dependency-free fixed-window limiter (global 300/min per IP,
+   session-create/rent 12/min, guest-provision 30/min), a 128 KiB body cap, and
+   `Cache-Control: no-store` + `nosniff` on every response. 4xx are logged as
+   structured `request rejected` events with the route *pattern*, never the
+   concrete URL.
+8. **The CSP was documented but missing.** `apps/web/index.html` said "the real
+   CSP is served by Caddy"; Caddy had none. Added a CSP compatible with the
+   bundle, Google Fonts and Guacamole blobs.
+9. **Marketplace listing input was unbounded.** `hourlyRateUsd` accepted
+   negatives/NaN (ledger corruption), and the name/credential fields were
+   unbounded. Both are validated now.
+10. **Config gaps:** `VAULT_*_FILE` support (keeps secrets out of
+    `docker inspect`), production `https` requirement for Vault (with an
+    explicit private-network acknowledgement), TTL bounds, and a Vault identity
+    is mandatory whenever `VAULT_ADDR` is set.
+
+**Docs added:** [docs/security/architecture.md](docs/security/architecture.md),
+[secrets-management.md](docs/security/secrets-management.md),
+[threat-model.md](docs/security/threat-model.md),
+[incident-response.md](docs/security/incident-response.md),
+[operations.md](docs/security/operations.md); `docs/security.md` is the index and
+gained Guarantee 9 (no Vault administrator credential).
+
+**Verification.** `npm run typecheck` clean; `npm test` **635 passed, 7 skipped**
+(api **466**, broker **123**, web **46**) — +65 tests; `npm run build` green.
+`npm audit --omit=dev` is clean of runtime-path advisories after bumping Fastify
+to 5.12.7 and pinning `qs` ≥6.17.0 (transitive via Stripe) in the root
+`overrides`; the remaining report is the Prisma **CLI** (`deepmerge-ts`), a
+dev/build-time dependency whose fix is Prisma 7 (a major upgrade, not taken
+here), plus Vite/Vitest dev-server advisories.
+
+**Not validated here (explicit):** no Docker daemon, so the compose/Caddy
+changes were reviewed, not run; Vault policies/bootstrap were not applied to a
+live Vault; the Redis store was tested against a minimal RESP test server, not
+Redis; the CSP was not browser-verified.
+
+---
+
 ## 5. Consolidated decision register (with reasoning)
 
 Each item: the decision, why, and what I rejected.
@@ -1129,7 +1439,8 @@ npm-workspaces monorepo, Node ≥ 22, Vitest, `tsconfig.base.json` with `strict`
 - `deploy/`, `scripts/` — local launcher and deploy env.
 
 The seams that keep dev/tests free of AWS/DB: `CloudProvider` (`FakeCloudProvider`
-/ `AwsCloudProvider` stub), `VaultClient` (`FakeVaultClient`/`HttpVaultClient`),
+/ `AwsCloudProvider` — **real** EC2 via a lazily-imported SDK; tests inject
+`ec2ClientFactory`), `VaultClient` (`FakeVaultClient`/`HttpVaultClient`),
 `HsmService` (`SoftwareHsm` / `RotatingCredentialHsm` over a durable key; the
 test-only `generateEphemeralHsm`), `MarketplaceStore` (`InMemoryMarketplaceStore` /
 `PrismaMarketplaceStore` with a gated fallback), `StripeClient`
@@ -1294,8 +1605,22 @@ fallback, non-connection error propagates); `prisma-persistence.pg.test.ts`
   `hasActiveSessionForLicense(license_id)` (computed fail-closed), not by the
   open-rental invariant alone; an abandoned claim is released only when no
   non-terminal session remains linked to the license.
-- **Cloud cleanup unverified** — `AwsCloudProvider` is a stub; production
-  `terminateInstance` is untested. **The real cloud flow is not claimed to work.**
+- **Cloud teardown: unit-proven, not soak-proven (corrected r9, §4.10).**
+  `AwsCloudProvider` is real EC2, **not** a stub. `launchInstance` /
+  `terminateInstance` / `describeInstance` / `describeManaged` are covered
+  against an injected EC2 double (success, AWS error, not-found-as-idempotent,
+  partial-launch cleanup), and one full owner → renter → real VM → browser
+  desktop → terminate cycle was run by hand. **Not** proven: that the reaper
+  reclaims a long-lived fleet unattended over days, or that launch-template
+  subnet/SG ownership survives more than one template.
+- **The launch template, not `.env`, decides what boots.** `AWS_SESSION_AMI_ID`
+  and `AWS_SESSION_INSTANCE_TYPE` are validated at startup but are **not sent**
+  on `RunInstances` (ADR-001: the template *is* the VM spec). A drifted or
+  re-created template therefore silently launches a different image or size and
+  nothing notices. Two candidate remedies — assert the launched
+  `ImageId`/`InstanceType` against config and fail closed, or drop those settings
+  from config so there is one source of truth — both change ADR-001 and are
+  deliberately **not** chosen unilaterally.
 - **Key custody is software-only; Vault is mock-tested (addressed r7, with limits).**
   The Layer-2 credential key is now durable and validated (a real `SHA-256(SPKI)`
   key id, algorithm + actual modulus recorded and re-checked, rotation via
@@ -1337,7 +1662,7 @@ fallback, non-connection error propagates); `prisma-persistence.pg.test.ts`
   against AWS's real regional instance-identity certs + a live IMDS document,
   persist the launched AMI per instance (no `image_id` column), and add a
   multi-region key map. `DFAP_GUEST_PROVISIONING=instance-identity` is refused in
-  production until then ([runbooks/guest-provisioning.md](runbooks/guest-provisioning.md)).
+  production until then ([guest-provisioning runbook](docs/runbooks/guest-provisioning.md)).
 - **License has no org (new r4)** — release is owner-only because
   `software_licenses` carries no owning org, so a tenant-scoped admin/operator
   release cannot be expressed. Needs a server-side license→org mapping.
@@ -1359,9 +1684,10 @@ the web `VITE_OIDC_*` build vars; seed `external_identities` for real users with
 the provisioning CLI; set `DFAP_PAIR_MASTER_KEY` (base64 ≥32 bytes,
 secret-managed) and `DFAP_CREDENTIAL_KEY_FILE`/`DFAP_CREDENTIAL_KEY_PEM` (durable;
 replace the software provider with Vault Transit / CloudHSM for hardware backing);
-point `VAULT_ADDR`/`VAULT_TOKEN` at a **real** cluster (the adapter is mock-tested
-only) and execute the documented owner-credential→Vault migration; apply the
-Prisma migrations.
+point `VAULT_ADDR` at a **real** cluster with a scoped AppRole
+(`VAULT_APPROLE_ROLE_ID`/`SECRET_ID`; the adapter is mock-tested only) and
+execute the documented owner-credential→Vault migration; apply the Prisma
+migrations.
 
 ---
 
@@ -1436,9 +1762,11 @@ npx prisma migrate dev          # local: applies the pending migrations
 2. Configure a durable owner-credential key: `DFAP_CREDENTIAL_KEY_FILE` or
    `DFAP_CREDENTIAL_KEY_PEM` (r7). Production refuses an ephemeral key. Rotation,
    backup, and the key-id scheme are in `docs/runbooks/key-management.md`.
-3. Point `VAULT_ADDR`/`VAULT_TOKEN` at a real Vault (r7 makes production refuse
-   the in-memory `FakeVaultClient`; the HTTP adapter is mock-tested only), and
-   execute the documented owner-credential→Vault custody migration when ready.
+3. Point `VAULT_ADDR` at a real Vault and give the API a scoped AppRole
+   (`make vault-bootstrap` → `VAULT_APPROLE_ROLE_ID`/`SECRET_ID`). Never use the
+   root token; production refuses the in-memory `FakeVaultClient` (r7/r12). The
+   HTTP adapter is mock-tested only. Then execute the documented
+   owner-credential→Vault custody migration when ready.
 4. Swap the software key provider for Thales Luna / CloudHSM / Vault Transit (same
    seam) if hardware-backed custody is required — none is implemented today.
 
@@ -1645,7 +1973,45 @@ and `apps/web/package.json`); r7 and r8 added no dependency. `.dfap/` (the dev
 credential-key directory, created on first non-production boot/test) is gitignored
 along with `*.pem`/`*.key`. **Nothing is committed or pushed.**
 
-**Status: the r8 milestone is complete and green. No work is mid-flight.**
+**Status: the r12 secrets-management pass is complete and green. No work is
+mid-flight.** r10 structure: `services/api/src/http/` (routes, contracts, session
+view), `services/api/src/db/repos/` (repo modules behind a barrel),
+`apps/web/src/session/{launch-types,useCatalog,useSessionLaunch,LaunchProgress,OwnerListingForm}`,
+`.github/workflows/ci.yml`, `.env.example`, `docs/configuration.md`. r11 added
+`services/broker/src/secrets.ts`, `services/broker/test/{config,secrets}.test.ts`,
+the `GUACD_ALLOW_CLEARTEXT` guard, and root-volume `Encrypted: true`. r12 added
+`services/api/src/vault/{errors,vault-auth}.ts`,
+`services/api/src/http/rate-limit.ts`,
+`services/broker/src/redis-nonce-store.ts`, `deploy/vault/{policies,bootstrap.sh}`,
+`docs/security/{architecture,secrets-management,threat-model,incident-response,operations}.md`,
+and the tests listed in §4.13. The old
+`services/api/src/db/prisma-repos.ts` is deleted in the working tree (its content
+moved, not dropped) — expect the diff to show a delete plus the new directory.
+
+Still open after r12 (all pre-existing, none introduced by the refactor):
+
+- **`services/api/src/server.ts` is still a ~660-line composition root**
+  (`buildServer` ≈ 420 lines). It is straight-line wiring with no branching
+  logic, and splitting it is mechanical but easy to get subtly wrong; it was left
+  intact deliberately rather than risk provisioning behaviour for cosmetics. The
+  env reads were consolidated into `config.ts`.
+- **No linter.** `tsc --noEmit` (strict) is the static gate. Adding ESLint or
+  Prettier would require a mass reformat of ~150 files, which the working
+  agreement explicitly rules out; `.editorconfig`-level consistency was not
+  deemed worth a repository-wide diff.
+- **Session reads are now renter-only.** If product intent was "team members may
+  take over each other's desktops", that is a deliberate access decision that
+  should be made in the product, not implied by an org check; the current rule is
+  owner-reads / owner-or-admin-ends.
+- **The broker is in-process; a split deployment is not implemented.** The
+  standalone entrypoint fails fast instead of booting with stubs. Splitting it out
+  needs an authenticated resolver endpoint (service identity + bounded payload +
+  its own Vault policy) before it is safe or even functional.
+- **Vault policies and the bootstrap script are reviewed, not applied.** No live
+  Vault was available in this environment; `make vault-bootstrap` must be run by
+  the operator after init/unseal.
+- **Rate limiting is in-process.** Per-IP fixed windows are an abuse brake, not a
+  distributed quota.
 
 Queued next moves (gated on your answers in §9.1):
 
@@ -1673,12 +2039,12 @@ Queued next moves (gated on your answers in §9.1):
 6. **Marketplace UI component test** in `apps/web`, plus a browser-level CORS
    check against the exact allowlist.
 7. **AWS Level A walkthrough** (needs D2–D4 + account/region/profile).
-8. **Real Vault + hardware-backed key custody** — point `VAULT_ADDR` /
-   `VAULT_TOKEN` at a live cluster (the HTTP adapter is mock-tested only) and, if
-   hardware custody is required, replace the software key provider with Vault
-   Transit / CloudHSM; then execute the documented owner-credential→Vault
+8. **Real Vault + hardware-backed key custody** — run
+   `make vault-bootstrap` against a live cluster, enable a Vault audit device,
+   then (if hardware custody is required) replace the software key provider with
+   Vault Transit / CloudHSM and execute the documented owner-credential→Vault
    migration (`docs/runbooks/key-management.md`). Production already refuses to
-   boot without a durable key, the pair master, and Vault (r7).
+   boot without a durable key, the pair master, and a Vault identity (r7/r12).
 9. **Remaining audit findings** — H7, M1–M9, L1–L5, and the `listTemplates`
    fallback sibling of C1. (C4 closed in r4; **H4 and H5 closed in r7**; **C3
    closed in r8**, production-gated.)

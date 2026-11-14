@@ -33,6 +33,8 @@ export interface PreBootCredential {
   username: string;
   password?: string;
   privateKey?: string;
+  /** Only fresh DisFAP demo credentials may be placed in evaluation userData. */
+  demoOnly?: boolean;
 }
 
 export interface PreBootInjection {

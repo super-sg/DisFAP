@@ -11,11 +11,15 @@
  *                                     └──────────────── disconnected ◀───────┘
  *
  *   FATAL from anywhere ──▶ error        RESET from anywhere ──▶ idle
+ *   EXPIRED (server ended the session after the grace window) ──▶ expired
  *
- * Reconnect policy (Phase-0): a transient socket close moves us to
- * `disconnected` and the controller re-fetches a *fresh* DFAP1 handle before
- * dispatching RECONNECT (the old one is single-use and likely expired). After
- * MAX_RECONNECT_ATTEMPTS the machine latches to `error`.
+ * Reconnect policy: a transient socket close moves us to `disconnected` and the
+ * controller re-fetches a *fresh* DFAP1 handle before dispatching RECONNECT (the
+ * old one is single-use and its Vault wrap token is spent). After
+ * MAX_RECONNECT_ATTEMPTS the machine latches to `error`; once the server reports
+ * the session terminal (or its grace window has expired) it latches to
+ * `expired`, which is NOT retryable. The UI must never show a connected session
+ * that the server has already ended.
  */
 
 export type ConnState =
@@ -24,7 +28,8 @@ export type ConnState =
   | 'connecting'
   | 'connected'
   | 'disconnected'
-  | 'error';
+  | 'error'
+  | 'expired';
 
 export interface ConnContext {
   state: ConnState;
@@ -51,6 +56,8 @@ export type ConnEvent =
   | { type: 'RECONNECT' }
   /** Unrecoverable failure. */
   | { type: 'FATAL'; reason: string }
+  /** The server ended the session (grace expired, user/admin end, failure). */
+  | { type: 'EXPIRED'; reason?: string }
   /** Return to the initial state (e.g. user ended the session). */
   | { type: 'RESET' };
 
@@ -84,9 +91,19 @@ export function transition(ctx: ConnContext, event: ConnEvent): ConnContext {
     case 'FATAL':
       return { ...ctx, state: 'error', error: event.reason, channelOpen: false };
 
+    case 'EXPIRED':
+      // Terminal: no retry loop, no false "connected" overlay.
+      return {
+        ...ctx,
+        state: 'expired',
+        error: event.reason ?? 'this session has ended',
+        channelOpen: false,
+      };
+
     case 'ALLOCATE':
       // Allowed from any non-live state; clears prior error and counters.
-      if (ctx.state === 'connected' || ctx.state === 'connecting') return ctx;
+      // `expired` is terminal: only RESET leaves it.
+      if (ctx.state === 'connected' || ctx.state === 'connecting' || ctx.state === 'expired') return ctx;
       return { ...initialContext, state: 'allocating' };
 
     case 'READY':
@@ -108,7 +125,7 @@ export function transition(ctx: ConnContext, event: ConnEvent): ConnContext {
       return ctx;
 
     case 'SOCKET_CLOSED': {
-      if (ctx.state === 'idle' || ctx.state === 'error') return ctx;
+      if (ctx.state === 'idle' || ctx.state === 'error' || ctx.state === 'expired') return ctx;
       if (!event.transient) {
         // Intentional close (user ended / normal disconnect): no reconnect.
         return { ...ctx, state: 'disconnected', channelOpen: false };

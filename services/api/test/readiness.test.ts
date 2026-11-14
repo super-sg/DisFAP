@@ -18,6 +18,7 @@ function session(overrides: Partial<SessionRecord> = {}): SessionRecord {
     firstPixelAt: null,
     connectedAt: null,
     disconnectedAt: null,
+    disconnectDeadlineAt: null,
     endedAt: null,
     endReason: null,
     billableSeconds: null,
@@ -32,6 +33,7 @@ interface Harness {
   reconciler: ReadinessReconciler;
   update: ReturnType<typeof vi.fn>;
   markState: ReturnType<typeof vi.fn>;
+  markConnectHost: ReturnType<typeof vi.fn>;
   failSession: ReturnType<typeof vi.fn>;
   info: CloudInstanceInfo | null;
   probeResult: boolean;
@@ -47,6 +49,7 @@ function harness(opts: {
 }): Harness {
   const update = vi.fn(async (id: string, patch: Record<string, unknown>) => session({ id, ...patch }));
   const markState = vi.fn(async () => undefined);
+  const markConnectHost = vi.fn(async () => undefined);
   const failSession = vi.fn(async () => undefined);
 
   const state = {
@@ -69,6 +72,7 @@ function harness(opts: {
     instances: {
       findConnect: async () => ({ cloudInstanceId: 'i-1', host: opts.host === undefined ? '203.0.113.9' : opts.host }),
       markState: markState as never,
+      markConnectHost: markConnectHost as never,
     },
     cloud,
     failSession: failSession as never,
@@ -77,7 +81,7 @@ function harness(opts: {
     ...(opts.readyTimeoutMs !== undefined ? { readyTimeoutMs: opts.readyTimeoutMs } : {}),
   });
 
-  return { reconciler, update, markState, failSession, info: state.info, probeResult: state.probeResult };
+  return { reconciler, update, markState, markConnectHost, failSession, info: state.info, probeResult: state.probeResult };
 }
 
 describe('ReadinessReconciler', () => {
@@ -88,6 +92,27 @@ describe('ReadinessReconciler', () => {
     expect(h.update).toHaveBeenCalledWith('ses_1', expect.objectContaining({ state: 'ready' }));
     expect(h.markState).toHaveBeenCalledWith('inst_1', 'active', expect.any(Date));
     expect(h.failSession).not.toHaveBeenCalled();
+  });
+
+  it('records the reachable host when the stored one is stale (public IP learned late)', async () => {
+    // RunInstances often omits the public IP while the instance is pending, so
+    // the pool row falls back to the private IP — unreachable for a broker
+    // outside the VPC. The probe reaches the public IP the cloud reports, and
+    // that verified host must be persisted so the broker dials the right place.
+    const h = harness({
+      rows: [session()],
+      host: '10.0.0.5',
+      info: { state: 'running', publicIp: '203.0.113.9' },
+    });
+    const out = await h.reconciler.reconcile();
+    expect(out.ready).toEqual(['ses_1']);
+    expect(h.markConnectHost).toHaveBeenCalledWith('inst_1', '203.0.113.9');
+  });
+
+  it('does not rewrite the connect host when it already matches', async () => {
+    const h = harness({ rows: [session()] });
+    await h.reconciler.reconcile();
+    expect(h.markConnectHost).not.toHaveBeenCalled();
   });
 
   it('does NOT promote while the gateway port is still closed', async () => {
@@ -152,6 +177,49 @@ describe('ReadinessReconciler', () => {
     });
     const out = await reconciler.reconcile();
     expect(out).toEqual({ checked: 0, ready: [], failed: [], waiting: 0 });
+  });
+
+  it('isolates a failing session so the rest of the pass still runs', async () => {
+    // A throttled DescribeInstances — or a transient database error on a single
+    // row — must not stall every other pending session. Each row is reconciled
+    // inside its own try/catch and simply retried on the next pass.
+    const update = vi.fn(async (id: string, patch: Record<string, unknown>) => session({ id, ...patch }));
+    const failSession = vi.fn(async () => undefined);
+    let calls = 0;
+
+    const reconciler = new ReadinessReconciler({
+      sessions: {
+        listByState: async () => [session({ id: 'ses_bad' }), session({ id: 'ses_good' })],
+        update: update as never,
+      },
+      instances: {
+        findConnect: async () => ({ cloudInstanceId: 'i-1', host: '203.0.113.9' }),
+        markState: vi.fn(async () => undefined) as never,
+      },
+      cloud: {
+        launchInstance: vi.fn(),
+        terminateInstance: vi.fn(),
+        describeManaged: vi.fn(async () => []),
+        describeInstance: vi.fn(async () => {
+          calls += 1;
+          if (calls === 1) {
+            throw Object.assign(new Error('rate exceeded'), { name: 'Throttling' });
+          }
+          return { state: 'running' as const, publicIp: '203.0.113.9' };
+        }),
+      } as unknown as CloudProvider,
+      failSession: failSession as never,
+      probe: async () => true,
+      now: () => new Date('2026-10-16T00:01:00Z'),
+    });
+
+    const out = await reconciler.reconcile();
+
+    expect(out.checked).toBe(2);
+    expect(out.ready).toEqual(['ses_good']);
+    expect(out.waiting).toBe(1);
+    // The blip is not a session failure: it stays `allocating` and retries.
+    expect(failSession).not.toHaveBeenCalled();
   });
 });
 

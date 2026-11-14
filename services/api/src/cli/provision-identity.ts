@@ -23,7 +23,7 @@
 import { PrismaClient } from '@prisma/client';
 
 import { provisionIdentity } from '../auth/identity-provisioning.js';
-import { PrismaIdentityProvisioningStore } from '../db/prisma-repos.js';
+import { PrismaIdentityProvisioningStore } from '../db/repos/index.js';
 
 interface Args {
   issuer: string | undefined;
