@@ -1,0 +1,57 @@
+.page {
+  animation: dfap-fade-in 150ms ease both;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #f8fafc;
+  margin: 0;
+}
+
+.subtitle {
+  color: #94a3b8;
+  font-size: 0.875rem;
+  margin: 0;
+}
+
+.errorState {
+  padding: 1rem;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 6px;
+  color: #fca5a5;
+  background: rgba(127, 29, 29, 0.16);
+}
+
+.errorState p { margin: 0 0 0.75rem; }
+
+.errorState button {
+  padding: 0.4rem 0.7rem;
+  color: #e2e8f0;
+  border: 1px solid #475569;
+  border-radius: 4px;
+}
+
+.tableContainer {
+  background: #0d131f;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: #cbd5e1;
+}
+

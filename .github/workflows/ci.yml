@@ -1,0 +1,51 @@
+name: CI
+
+# Verification only: no cloud credentials, no database service, no deployment.
+# Anything that would cost money (real EC2) lives in the runbooks and is run
+# deliberately by an operator, never by CI.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Keep any incidental AWS tooling from reaching for a role.
+      AWS_EC2_METADATA_DISABLED: 'true'
+      CI: 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run prisma:generate --workspace=@disfap/api
+
+      - name: Typecheck (api, broker, web)
+        run: npm run typecheck
+
+      - name: Test (api, broker, web)
+        # The Postgres integration suite self-skips when DATABASE_URL is
+        # unreachable, so this job needs no database service.
+        run: npm test
+
+      - name: Build (api, broker, web)
+        run: npm run build

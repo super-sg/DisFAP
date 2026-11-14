@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="DisFAP — Secure workspace-as-a-service. Contractors, auditors, and third parties work through the browser. The endpoint never holds anything but pixels." />
+    <meta name="theme-color" content="#0a0e17" />
+    <!--
+      isolation layer 4: forbid referrer leakage and pin a strict-ish default.
+      The real CSP is served by Caddy in front of the app; this is defense in
+      depth so a stray build still refuses inline data exfiltration vectors.
+    -->
+    <meta name="referrer" content="no-referrer" />
+    <!-- Inter font — premium, modern sans-serif -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+    <title>DisFAP — Secure Workspace</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

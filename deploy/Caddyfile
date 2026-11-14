@@ -1,0 +1,81 @@
+# =============================================================================
+# DisFAP — Caddy reverse proxy (Phase-0)
+# =============================================================================
+# The single internet-facing process. Terminates TLS and fans out to the app
+# services on the private `edge` network by DNS name. guacd/Postgres/Redis/Vault
+# are NOT routable from here — Caddy only knows web and api (the broker runs
+# in-process inside the api container; see docs/security/architecture.md).
+#
+# Env (from compose, see .env.example):
+#   DFAP_SITE_ADDRESS  site address. "localhost" for local dev; a real FQDN in
+#                      production (Caddy then auto-provisions Let's Encrypt).
+#   CADDY_ACME_EMAIL   ACME contact address for the production certificate.
+# =============================================================================
+
+{
+	# ACME contact used only when a public FQDN is set as the site address.
+	email {$CADDY_ACME_EMAIL:admin@localhost}
+}
+
+{$DFAP_SITE_ADDRESS:localhost} {
+	# Compress everything except the WebSocket (Caddy skips upgraded conns).
+	encode zstd gzip
+
+	# Security headers. HSTS is safe here because everything is HTTPS-only.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Never advertise the reverse proxy.
+		-Server
+		# CSP for the SPA and the Guacamole canvas.
+		#  - script-src 'self': the bundle is external; no inline script, no eval.
+		#  - style-src allows inline (React inline styles + Guacamole's DOM
+		#    tweaks) and the Google Fonts stylesheet used by index.html.
+		#  - img/media/worker allow blob: because Guacamole decodes into blobs.
+		#  - connect-src 'self' + wss: for /api and the same-origin /tunnel socket.
+		#  - frame-ancestors 'none' matches X-Frame-Options DENY.
+		Content-Security-Policy "default-src 'self'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+	}
+
+	# --- Control-plane API -----------------------------------------------------
+	# Path prefix is preserved: the API mounts its router under /api, so the
+	# Stripe webhook URL (https://<host>/api/billing/webhook) stays stable.
+	# `header_up X-Forwarded-For {remote_host}` OVERWRITES any client-supplied
+	# value. Fastify trusts exactly one hop, so a forged XFF cannot spoof
+	# `req.ip` (which is the rate-limit bucket key and the audit field).
+	handle /api/* {
+		reverse_proxy api:3000 {
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	# --- Broker WebSocket tunnel (pixels) -------------------------------------
+	# The broker runs in the api process and listens on BROKER_PORT (8080)
+	# inside that container. Caddy v2 detects the `Upgrade: websocket` header
+	# and proxies the raw, bidirectional stream automatically. The DFAP1 connect
+	# token arrives as the first WS *frame*, never in the URL or a header, so it
+	# never lands in an access log.
+	handle /tunnel* {
+		reverse_proxy api:8080 {
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	# --- Browser client (static SPA) ------------------------------------------
+	# Everything else is the React app served by the `web` nginx container.
+	handle {
+		reverse_proxy web:80
+	}
+
+	# --- TLS -------------------------------------------------------------------
+	# PHASE-0 LOCAL DEV: Caddy's built-in CA issues a self-signed cert for
+	# `localhost`. Your browser will warn once — trust it, or install Caddy's
+	# root (see README "Trusting the local CA").
+	#
+	# PRODUCTION: delete the line below and set DFAP_SITE_ADDRESS to your FQDN
+	# plus CADDY_ACME_EMAIL. Caddy then auto-provisions a real Let's Encrypt
+	# certificate over the published :80/:443 — nothing else changes.
+	tls internal
+}

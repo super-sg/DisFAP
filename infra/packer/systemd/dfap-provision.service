@@ -1,0 +1,42 @@
+# =============================================================================
+# dfap-provision.service — DisFAP Linux guest credential provisioning (M8).
+#
+# One-shot at boot, BEFORE xrdp/xrdp-sesman. It proves this instance's identity
+# to the control plane and materializes the least-privilege session account.
+#
+# FAIL CLOSED: the unit exits non-zero when provisioning fails, and the xrdp
+# gate drop-in (xrdp-gate.conf) makes xrdp/xrdp-sesman `Requires=` this unit, so
+# a failed provision means the RDP listener never starts. There is deliberately
+# NO ConditionPathExists that could silently skip the unit and let xrdp expose a
+# login with no account behind it.
+#
+# Installed to /etc/systemd/system by install-workspace.sh.
+# =============================================================================
+[Unit]
+Description=DisFAP guest credential provisioning (fail-closed, before login exposure)
+Documentation=file:///etc/dfap/guest-provisioning.md
+Wants=network-online.target
+After=network-online.target
+Before=xrdp.service xrdp-sesman.service dfap-deadman.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Knobs and the control-plane URL live here; the leading '-' tolerates absence
+# so the script's own fail-closed check (DFAP_PROVISIONING_ENABLED!=1) decides.
+EnvironmentFile=-/etc/dfap/provision.env
+ExecStart=/usr/local/sbin/dfap-provision.sh
+
+# Sandboxing that still permits account creation (writes /etc, /home, /run).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+
+[Install]
+# So `systemctl enable dfap-provision.service` (install-workspace.sh) is valid.
+# It is also pulled in by xrdp's Requires= via the gate drop-in; being a
+# multi-user dependency just makes the failure visible early in the boot log.
+WantedBy=multi-user.target

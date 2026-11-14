@@ -1,0 +1,89 @@
+.page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at 50% 20%, #111726 0%, #06090e 100%);
+  padding: 1.5rem;
+  color: #f8fafc;
+}
+
+.card {
+  width: 100%;
+  max-width: 440px;
+  background: #0d121d;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  padding: 2.25rem;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.brandRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.brandText {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: #f8fafc;
+  letter-spacing: -0.02em;
+}
+
+.brandAccent {
+  color: #0284c7;
+}
+
+.title {
+  font-size: 1.125rem;
+  font-weight: 600;
+  color: #f1f5f9;
+  margin: 0;
+}
+
+.subtitle {
+  font-size: 0.84375rem;
+  color: #94a3b8;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.error {
+  padding: 0.75rem 1rem;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  border-radius: 6px;
+  color: #f87171;
+  font-size: 0.8125rem;
+}
+
+.button {
+  height: 38px;
+  padding: 0 1.25rem;
+  background: #0284c7;
+  color: #ffffff;
+  border: 1px solid #0369a1;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: all 140ms ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.button:hover:not(:disabled) {
+  background: #0ea5e9;
+  border-color: #0284c7;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

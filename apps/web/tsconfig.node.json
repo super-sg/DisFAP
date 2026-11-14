@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Build-tooling context (vite.config.ts / vitest.config.ts) runs under Node.
+    "lib": ["ES2023"],
+    "types": ["node"],
+    // composite requires emit; we emit only declarations to a throwaway dir so
+    // the project-reference constraint is satisfied without polluting output.
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationDir": "./dist-node-types",
+    "sourceMap": false,
+    "composite": true
+  },
+  "include": ["vite.config.ts", "vitest.config.ts"]
+}
